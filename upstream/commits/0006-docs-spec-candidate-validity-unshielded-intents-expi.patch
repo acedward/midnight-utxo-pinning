@@ -1,7 +1,7 @@
 From 7cee48ea131bae2dc10aba82cbf99e0d0ecd663b Mon Sep 17 00:00:00 2001
 From: Eddie <edward.alvarado@midnight.foundation>
 Date: Tue, 8 Sep 2026 19:39:19 -0300
-Subject: [PATCH 6/7] docs(spec): candidate validity - unshielded intents
+Subject: [PATCH 6/8] docs(spec): candidate validity - unshielded intents
  expire by TTL; bounds are ledger-enforced
 
 ---

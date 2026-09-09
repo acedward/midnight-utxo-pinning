@@ -120,30 +120,30 @@ A **hold** is keyed by (**scope**, **id**).
   network identifiers.
 - The **id** is chosen by the application. It is a label, not a capability: unique only within its scope, shared
   freely by many coins and many transactions, never interpreted by the wallet.
-- A hold is a policy: `mode` (`single` backs one live candidate, `multi` backs any number of siblings and rebuilds),
-  `expires_at` for reservations, an optional `note`. Its coins (shielded coins, Dust included, and unshielded UTxOs)
-  are found through their booking records; one coin may carry references under several ids of the same scope.
+- A hold is a policy: `expires_at` for reservations and an optional `note`. Its coins (shielded coins, Dust included,
+  and unshielded UTxOs) are found through their booking records; one coin may carry references under several ids of
+  the same scope. How many candidates an id backs is the application's choice: a one-shot candidate uses an id that
+  is never reused.
 
 ### 3. Authorization on `spend`
 
 A build may carry `use: X` and, optionally, `mark: Y` (defaulting to X):
 
-- If no hold (scope, X) exists yet, it is created implicitly (mode `multi`) and coins are selected from unpinned final
-  coins.
+- If no hold (scope, X) exists yet, it is created implicitly and coins are selected from unpinned final coins.
 - Otherwise coins pinned under (scope, X) are selected first; if they do not cover the request, unpinned coins are
   added.
 - Every selected coin, found or added, gets this build's reference under (scope, Y): the count of Y on the coin grows
   by one. With the default Y = X that is simply "one more bid with X"; `use: r7, mark: r8` knowingly backs a round-8
   bid with round-7's coins. Coins pinned only under other ids are never taken.
-- The finished transaction is handed to the scope with its validity bound; the transaction booking is released and the
-  pins keep the coins reserved.
+- The finished transaction is handed to the scope; the transaction booking is released and the pins keep the coins
+  reserved.
 
 Without an authorization, coin selection works exactly as today and never touches booked coins.
 
 ### 4. Two operations
 
 - `hold(scope, id, selection, policy)` — reserve coins up front without building anything (a `reservation` reference
-  that lapses at `expires_at`), or set `single` mode before the first build creates the hold implicitly.
+  that lapses at `expires_at`), or set the policy before the first build creates the hold implicitly.
 - `detach_transaction(transaction | {id}, {force?})` — drop one candidate, or every candidate and the reservation
   under an id: remove the references from the coins, mark the candidates `Rejected(detached)`, and remember them as
   `outstanding` while they could still settle. `force: true` skips the memory when the caller knows the candidate was
@@ -172,7 +172,7 @@ sequenceDiagram
     U-->>W: yes
     W->>W: prove + bind offer A: +100 NIGHT, −1 TOKEN_A, change 50
     W->>W: hand off A: Pending{submitter=M}<br/>X = Booked{round-7 → {A}}, build booking released
-    W-->>M: offer A + validity bound
+    W-->>M: offer A
 
     M->>W: build bid B (use "round-7")
     W->>W: X selected again, prove, bind, hand off<br/>X = Booked{round-7 → {A, B}}
@@ -247,8 +247,9 @@ memory at all.
 
 ### Validity of a candidate
 
-Every candidate has a bound after which the ledger refuses it. The wallet returns the bound with the candidate, and a
-`multi` hold lets the application rebuild with `use` before it passes without prompting the user again.
+Every candidate has a bound after which the ledger refuses it. The application can compute it without the wallet's
+help: root retention is a fixed network parameter (changing it is a hard fork) and the intent TTL is chosen at build
+time. The application rebuilds with `use` before the bound passes; the wallet does not prompt the user again.
 
 | Inputs | Bound | Enforced by |
 |---|---|---|
@@ -317,12 +318,10 @@ service, expiring at its TTL.
 
 ## Open points for reviewers
 
-1. Is the hold `mode` (`single` | `multi`) the right granularity, or should the limit be a count?
-2. Should the wallet expose its hold-duration cap and the network's root retention to dApps, and where?
-3. Fee-paying candidates fix the Dust amount at build time; is "the settler covers the shortfall" acceptable?
-4. Unshielded candidates carry random segment ids; is guidance needed on collisions when many users' bids merge?
-5. A hold created implicitly by a `mark`/`use` build is `multi`; is that the right default, with `single` opt-in
-   through `hold`?
+None at the moment. Earlier open points (hold mode vs. count, exposing network parameters, fee shortfall on
+fee-paying candidates, segment-id collisions, implicit-hold defaults) were resolved by simplifying the model: there is no
+hold mode, the wallet exposes no network parameters, and fee and segment-id handling belong to the settlement design,
+not to the wallet state.
 
 ## License
 

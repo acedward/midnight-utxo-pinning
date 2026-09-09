@@ -1,5 +1,5 @@
 diff --git a/docs/spec/Specification.md b/docs/spec/Specification.md
-index f30fd3b..c3b58d9 100644
+index f30fd3b..8297983 100644
 --- a/docs/spec/Specification.md
 +++ b/docs/spec/Specification.md
 @@ -67,6 +67,12 @@ This document comprises a couple of sections:
@@ -78,7 +78,7 @@ index f30fd3b..c3b58d9 100644
  
  Functions `apply_transaction`, `finalize_transaction` and `rollback_transaction` can be extended to blocks, ranges of
  blocks or other data to reconstruct the wallet state. Since shielded tokens are implemented using effectively a UTxO
-@@ -590,11 +612,227 @@ distinct balances recognized:
+@@ -590,11 +612,224 @@ distinct balances recognized:
  - total - sum of available and pending balances; it represents total amount of tokens under wallet's control, taking
    into consideration known pending transactions and coins
  
@@ -154,10 +154,6 @@ index f30fd3b..c3b58d9 100644
 +  transaction (many coins may be pinned under one `id`, and many transactions may be built with it), and it is never
 +  interpreted by the wallet
 +- a policy:
-+  - `mode` - `single` or `multi`. A `single` hold backs exactly one live candidate: while one exists, no further build
-+    with this `id` is accepted. A `multi` hold backs any number of sibling candidates from the same coins, including
-+    rebuilds of stale ones. The mode is fixed at creation; a hold created implicitly by a build (see `spend`) is
-+    `multi`, because asking to reuse an `id` is an explicit request for reuse
 +  - `expires_at` - wall-clock instant after which a reservation made with `hold` lapses; the wallet MAY cap it
 +  - an optional free `note`, stored, never interpreted, never leaving the owning scope
 +- creation time and, for auditing by the user, the identity that requested it
@@ -193,7 +189,8 @@ index f30fd3b..c3b58d9 100644
 +    while it is within its root retention window, so a candidate is *stale* once that window has passed and must be
 +    rebuilt from the hold to remain usable. The window is a property of the deployed ledger and MUST be read, not
 +    assumed: ledger v8 hard-codes 3600 seconds, ledger v9 takes it from the `global_ttl` ledger parameter, whose
-+    deployed value is expected to be much longer (days) but is not confirmed until a network running ledger v9 exists
++    deployed value is expected to be much longer (days) but is not confirmed until a network running ledger v9 exists.
++    The window is fixed for a network (changing it is a hard fork), so a scope can compute the bound itself
 +  - for Dust spends, the same root retention applies to the Dust commitment and generation trees, and the spend is
 +    additionally bound to the timestamp it was built with
 +  - for unshielded inputs, the TTL of the intent that carries them (chosen at build time, within the margin the ledger
@@ -306,7 +303,7 @@ index f30fd3b..c3b58d9 100644
  ### Operations
  
  #### `apply_transaction`
-@@ -621,7 +859,14 @@ fallible section.
+@@ -621,7 +856,14 @@ fallible section.
  1. Update coin commitment tree with commitments of outputs and transients present in the offer
  2. Verify obtained coin commitment tree root against provided one, implementation needs to revert updates to coin
     commitment tree and abort in case of inconsistency
@@ -322,7 +319,7 @@ index f30fd3b..c3b58d9 100644
  4. Watch for received coins, for each output:
     1. Match commitment with a set of pending coins, if there is a match, mark the matching pending coin as confirmed
     2. If commitment is not a match, try to decrypt output ciphertext, if decryption succeeds - add coin to known set as
-@@ -630,7 +875,9 @@ fallible section.
+@@ -630,7 +872,9 @@ fallible section.
  
  ##### Steps to apply unshielded offer of a section
  
@@ -333,7 +330,7 @@ index f30fd3b..c3b58d9 100644
  2. Filter outputs to narrow them down to only ones received by tracked addresses, for each one:
     1. Match the coin with pending ones, if there is a match, mark the matching pending coin as confirmed.
     2. Otherwise, add a coin to the known set as a confirmed.
-@@ -690,7 +937,11 @@ It needs to:
+@@ -690,7 +934,11 @@ It needs to:
     3. Restore coins spent in the transaction in a booked state
     4. Undo setting timestamp on Dust generation info related to Night UTxOs spent in the transaction
     5. Remove related Dust generation info
@@ -346,7 +343,7 @@ index f30fd3b..c3b58d9 100644
  
  There are a couple of practical considerations:
  
-@@ -706,9 +957,15 @@ giving up on submitting one. Following steps need to be taken:
+@@ -706,9 +954,15 @@ giving up on submitting one. Following steps need to be taken:
  
  1. Move transaction to transaction history as failed
  2. Remove coins received in the transaction
@@ -363,17 +360,18 @@ index f30fd3b..c3b58d9 100644
  #### `spend`
  
  Spend coins in a transaction, either by initiating swap, making transfer or balancing other transaction. Only final
-@@ -718,12 +975,40 @@ In certain situations implementation might allow to use confirmed and yet not fi
+@@ -718,12 +972,41 @@ In certain situations implementation might allow to use confirmed and yet not fi
  fail in case of reorganization because of coin commitment tree root mismatch, so a special care should be put into user
  experience of managing such transactions.
  
 +The operation takes an optional `authorization` from the requesting scope: `use: X`, and optionally `mark: Y`
 +(defaulting to `X`). Resolved within the caller's scope:
 +
-+1. If no hold (scope, `X`) exists, create it implicitly with mode `multi` and the wallet's default policy, and select
-+   coins with ordinary selection from unpinned final coins.
++1. If no hold (scope, `X`) exists, create it implicitly with the wallet's default policy, and select coins with
++   ordinary selection from unpinned final coins.
 +2. If it exists, select coins pinned under (scope, `X`) first; if they do not cover the request, add unpinned final
-+   coins. For a `single` hold that already has a live candidate, refuse.
++   coins. How many candidates an identifier backs is the scope's choice: a one-shot candidate simply uses an
++   identifier that is never reused.
 +   Every selected coin, found or added, is pinned under (scope, `Y`). With the default `Y = X` this simply grows the
 +   count of `X`; with `mark: r8` on `use: r7`, round-7's coins knowingly back a round-8 bid as well.
 +3. Coins pinned only under other identifiers are never taken, even within the same scope: taking a coin reserved for
@@ -404,21 +402,21 @@ index f30fd3b..c3b58d9 100644
  #### `watch_for`
  
  Watches for a coin whose details are provided. There are limitations, which require usage of this operation to receive
-@@ -735,6 +1020,63 @@ transaction history with "expected" status.
+@@ -735,6 +1018,63 @@ transaction history with "expected" status.
  Note: in many cases such transaction would be requested to be balanced, in such case the final transaction should only
  be added as pending one.
  
 +#### `hold`
 +
 +Reserves coins under an identifier without building a transaction (see [Holds and pinned coins](#holds-and-pinned-coins))
-+- to commit an amount up front, or to set a policy (`single` mode, expiry, note) before the first build with `use`
-+would create the hold implicitly. Parameters:
++- to commit an amount up front, or to set a policy (expiry, note) before the first build with `use` would create the
++hold implicitly. Parameters:
 +
 +- the requesting scope, derived by the wallet
 +- the `id` chosen by the scope; if a hold with that `id` already exists in the scope, the selected coins are added to it
 +- a selection: either explicit references to own final coins, or a map of token type to amount, in which case the
 +  wallet selects final, unpinned coins covering each amount using its ordinary coin selection
-+- a policy: `mode`, `expires_at`, optional `note`
++- a policy: `expires_at`, optional `note`
 +
 +Steps:
 +
@@ -433,9 +431,9 @@ index f30fd3b..c3b58d9 100644
 +treat the coins as unpinned.
 +
 +A wallet MAY require user confirmation for creating a hold, exactly as it may for any spend; a hold is a commitment of
-+funds and SHOULD be presented as such (amount, token type, requesting scope, mode, expiry). Confirmation is given once,
-+at creation, and covers every build the hold's mode allows - in particular a `multi` hold does not prompt again when
-+the scope rebuilds a stale candidate or builds a sibling.
++funds and SHOULD be presented as such (amount, token type, requesting scope, expiry). Confirmation is given once, at
++creation, and covers every later build with the same identifier - the wallet does not prompt again when the scope
++rebuilds a stale candidate or builds a sibling.
 +
 +#### `detach_transaction`
 +
@@ -468,7 +466,7 @@ index f30fd3b..c3b58d9 100644
  ## Synchronization process
  
  Literal implementation of a Midnight Wallet, applying transactions one by one, provided by a local node is the best
-@@ -1074,6 +1416,37 @@ The resulting transaction will only have outputs to be received defined, with no
+@@ -1074,6 +1414,36 @@ The resulting transaction will only have outputs to be received defined, with no
  balancing the transaction must be employed before the swap offer is ready to be submitted, with proper target imbalances
  indicated.
  
@@ -493,20 +491,19 @@ index f30fd3b..c3b58d9 100644
 +4. Prove, sign the intent (if any) and bind. The result is a transaction whose guaranteed shielded offer and whose
 +   intent (if any) are mergeable as a unit by any party: shielded offers merge by set union, intents merge by segment
 +   id.
-+5. Hand it to the caller together with its validity bound (this is the end of the authorized `spend`: the candidate
-+   reference is recorded on its inputs and the transaction booking released).
++5. Hand it to the caller (this is the end of the authorized `spend`: the candidate reference is recorded on its inputs
++   and the transaction booking released).
 +
 +Repeating steps 1-5 with the same `use: X` and different amounts or recipients produces sibling candidates from the
-+same coins (the hold is `multi`). The validity bound of a candidate is the minimum of: the root retention window for its shielded and Dust inputs
-+(counted from build time), and the TTL of its intent if it has one. The caller SHOULD schedule rebuilds before the
-+bound passes. Fees are a choice of the use case: when the settling party pays, the candidate is built without fees and
-+without an intent; when the bidder pays, the candidate carries a Dust spend and the fee amount is fixed at build time,
-+so the settling party MUST still cover any shortfall of the merged transaction.
++same coins. The validity bound of a candidate is the root retention window for its shielded inputs (counted from
++build time) or the TTL of its intent, whichever applies first. Both are known to the caller without help from the
++wallet: root retention is a network parameter, and the intent TTL is chosen at build time. The caller is responsible
++for rebuilding before the bound passes.
 +
  #### Contract call
  
  Contract calls are prepared by other components than wallet. Once ready, in most cases an unbalanced transaction would
-@@ -1141,6 +1514,10 @@ Conceptually, the process follows given steps:
+@@ -1141,6 +1511,10 @@ Conceptually, the process follows given steps:
  
  Once transaction is created, it can be submitted to the network or other party.
  

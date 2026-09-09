@@ -79,10 +79,6 @@ A hold is keyed by the pair (owning scope, `id`):
   transaction (many coins may be pinned under one `id`, and many transactions may be built with it), and it is never
   interpreted by the wallet
 - a policy:
-  - `mode` - `single` or `multi`. A `single` hold backs exactly one live candidate: while one exists, no further build
-    with this `id` is accepted. A `multi` hold backs any number of sibling candidates from the same coins, including
-    rebuilds of stale ones. The mode is fixed at creation; a hold created implicitly by a build (see `spend`) is
-    `multi`, because asking to reuse an `id` is an explicit request for reuse
   - `expires_at` - wall-clock instant after which a reservation made with `hold` lapses; the wallet MAY cap it
   - an optional free `note`, stored, never interpreted, never leaving the owning scope
 - creation time and, for auditing by the user, the identity that requested it
@@ -118,7 +114,8 @@ wallet's signatures and mergeable as a whole. The wallet keeps, for every candid
     while it is within its root retention window, so a candidate is *stale* once that window has passed and must be
     rebuilt from the hold to remain usable. The window is a property of the deployed ledger and MUST be read, not
     assumed: ledger v8 hard-codes 3600 seconds, ledger v9 takes it from the `global_ttl` ledger parameter, whose
-    deployed value is expected to be much longer (days) but is not confirmed until a network running ledger v9 exists
+    deployed value is expected to be much longer (days) but is not confirmed until a network running ledger v9 exists.
+    The window is fixed for a network (changing it is a hard fork), so a scope can compute the bound itself
   - for Dust spends, the same root retention applies to the Dust commitment and generation trees, and the spend is
     additionally bound to the timestamp it was built with
   - for unshielded inputs, the TTL of the intent that carries them (chosen at build time, within the margin the ledger
@@ -237,10 +234,11 @@ Insert into the existing `spend` operation, before its step list:
 The operation takes an optional `authorization` from the requesting scope: `use: X`, and optionally `mark: Y`
 (defaulting to `X`). Resolved within the caller's scope:
 
-1. If no hold (scope, `X`) exists, create it implicitly with mode `multi` and the wallet's default policy, and select
-   coins with ordinary selection from unpinned final coins.
+1. If no hold (scope, `X`) exists, create it implicitly with the wallet's default policy, and select coins with
+   ordinary selection from unpinned final coins.
 2. If it exists, select coins pinned under (scope, `X`) first; if they do not cover the request, add unpinned final
-   coins. For a `single` hold that already has a live candidate, refuse.
+   coins. How many candidates an identifier backs is the scope's choice: a one-shot candidate simply uses an
+   identifier that is never reused.
    Every selected coin, found or added, is pinned under (scope, `Y`). With the default `Y = X` this simply grows the
    count of `X`; with `mark: r8` on `use: r7`, round-7's coins knowingly back a round-8 bid as well.
 3. Coins pinned only under other identifiers are never taken, even within the same scope: taking a coin reserved for
@@ -269,14 +267,14 @@ coin at the same time (they may, deliberately, pin it under the same identifier 
 #### `hold`
 
 Reserves coins under an identifier without building a transaction (see [Holds and pinned coins](#holds-and-pinned-coins))
-- to commit an amount up front, or to set a policy (`single` mode, expiry, note) before the first build with `use`
-would create the hold implicitly. Parameters:
+- to commit an amount up front, or to set a policy (expiry, note) before the first build with `use` would create the
+hold implicitly. Parameters:
 
 - the requesting scope, derived by the wallet
 - the `id` chosen by the scope; if a hold with that `id` already exists in the scope, the selected coins are added to it
 - a selection: either explicit references to own final coins, or a map of token type to amount, in which case the
   wallet selects final, unpinned coins covering each amount using its ordinary coin selection
-- a policy: `mode`, `expires_at`, optional `note`
+- a policy: `expires_at`, optional `note`
 
 Steps:
 
@@ -291,9 +289,9 @@ restart. If the persisted hold state cannot be read or validated, the wallet MUS
 treat the coins as unpinned.
 
 A wallet MAY require user confirmation for creating a hold, exactly as it may for any spend; a hold is a commitment of
-funds and SHOULD be presented as such (amount, token type, requesting scope, mode, expiry). Confirmation is given once,
-at creation, and covers every build the hold's mode allows - in particular a `multi` hold does not prompt again when
-the scope rebuilds a stale candidate or builds a sibling.
+funds and SHOULD be presented as such (amount, token type, requesting scope, expiry). Confirmation is given once, at
+creation, and covers every later build with the same identifier - the wallet does not prompt again when the scope
+rebuilds a stale candidate or builds a sibling.
 
 #### `detach_transaction`
 
@@ -391,15 +389,14 @@ whether fees are to be paid:
 4. Prove, sign the intent (if any) and bind. The result is a transaction whose guaranteed shielded offer and whose
    intent (if any) are mergeable as a unit by any party: shielded offers merge by set union, intents merge by segment
    id.
-5. Hand it to the caller together with its validity bound (this is the end of the authorized `spend`: the candidate
-   reference is recorded on its inputs and the transaction booking released).
+5. Hand it to the caller (this is the end of the authorized `spend`: the candidate reference is recorded on its inputs
+   and the transaction booking released).
 
 Repeating steps 1-5 with the same `use: X` and different amounts or recipients produces sibling candidates from the
-same coins (the hold is `multi`). The validity bound of a candidate is the minimum of: the root retention window for its shielded and Dust inputs
-(counted from build time), and the TTL of its intent if it has one. The caller SHOULD schedule rebuilds before the
-bound passes. Fees are a choice of the use case: when the settling party pays, the candidate is built without fees and
-without an intent; when the bidder pays, the candidate carries a Dust spend and the fee amount is fixed at build time,
-so the settling party MUST still cover any shortfall of the merged transaction.
+same coins. The validity bound of a candidate is the root retention window for its shielded inputs (counted from
+build time) or the TTL of its intent, whichever applies first. Both are known to the caller without help from the
+wallet: root retention is a network parameter, and the intent TTL is chosen at build time. The caller is responsible
+for rebuilding before the bound passes.
 
 ## 5. Requirements checklist
 
@@ -413,11 +410,11 @@ Each requirement is traceable to the text above and to at least one conformance 
 | R-04 | Hold identifiers are chosen by the requesting scope and MUST resolve only within that scope; the same text in two scopes names two unrelated holds. | 2, hold structure; privacy 2 |
 | R-05 | A coin MAY carry references under several identifiers of the same scope; it is `Booked` iff it carries a `transaction` booking or at least one reference, and returns to `Final` when the last of them goes. | 2, hold structure; lifecycle |
 | R-06 | An ordinary `spend` (no authorization) MUST never select a booked coin, pinned or not, and its insufficient-funds error MUST NOT reveal whether pinned funds would have covered the shortage. | 3.1 |
-| R-07 | `use: X` MUST select coins pinned under (scope, X) first and MAY add unpinned final coins; if no hold X exists it MUST be created implicitly with mode `multi`. | 3.1 |
-| R-08 | Every selected coin, found or added, MUST receive this build's `candidate` reference under (scope, `mark`), `mark` defaulting to `use`; the build MUST end by handing the candidate to the scope with its validity bound and releasing the transaction booking. | 3.1 |
+| R-07 | `use: X` MUST select coins pinned under (scope, X) first and MAY add unpinned final coins; if no hold X exists it MUST be created implicitly with the wallet's default policy. | 3.1 |
+| R-08 | Every selected coin, found or added, MUST receive this build's `candidate` reference under (scope, `mark`), `mark` defaulting to `use`; the build MUST end by handing the candidate to the scope and releasing the transaction booking. | 3.1 |
 | R-09 | An authorized build MUST NOT select coins pinned under any other hold. | 3.1 |
 | R-10 | If an authorized build pays fees, Dust outputs pinned under `use` MUST be used first; unpinned Dust it needs MUST be pinned like any other coin. | 3.1 |
-| R-11 | A `single` hold MUST refuse a build with `use` while it has a live `Pending` candidate; a `multi` hold MUST accept siblings and rebuilds without further user confirmation. | 2, hold structure; 3.1 |
+| R-11 | An identifier MUST accept any number of candidates; a hold confirmed by the user once MUST NOT prompt again for siblings or rebuilds under the same identifier. | 3.2 `hold` |
 | R-12 | Selection, pinning and booking MUST be one atomic step, so concurrent builds cannot pin or book the same coin. | 3.1 |
 | R-13 | `hold` MUST select only final, unpinned coins, MUST add a `reservation` reference with `validUntil = expires_at`, and MUST fail without revealing whether other holds' coins would have sufficed. | 3.2 |
 | R-14 | Hold state MUST be persisted with wallet state and restored before any spend; unreadable or invalid hold state MUST block ordinary spends rather than treat coins as unpinned. | 3.2 `hold` |
@@ -430,12 +427,12 @@ Each requirement is traceable to the text above and to at least one conformance 
 | R-21 | `detach_transaction(transaction)` MUST remove that candidate's reference from every coin carrying it, mark it `Rejected(detached)` and, unless `force` is set, add an `outstanding` entry while its validity bound holds; `detach_transaction({id})` MUST do so for every reference under (scope, id) and drop the hold's policy. Both MUST be idempotent. | 3.2 |
 | R-22 | Coins with `outstanding` entries MUST be counted as available and MUST carry a user-visible warning while entries remain; a wallet MAY prefer them in ordinary selection. | 1; 2, lifecycle |
 | R-23 | References past their validity bound MUST be pruned automatically (a reservation at `expires_at`; a candidate at its bound, becoming `Rejected(stale|expired)` with no `outstanding` entry). | 2, lifecycle |
-| R-24 | The validity bound of a candidate MUST be the root retention window of the deployed ledger for shielded inputs (Dust included) and the smallest intent TTL for unshielded inputs, the earlier of the two when both kinds are present; it MUST be read from the network, not assumed, and MUST be returned with the candidate. | 2, candidates |
+| R-24 | The validity bound of a candidate MUST be the root retention window of the deployed ledger for shielded inputs (Dust included) and the smallest intent TTL for unshielded inputs, the earlier of the two when both kinds are present; the wallet MUST read root retention from the network, not assume it, and is NOT required to expose the bound, its hold-duration cap or network parameters to scopes. | 2, candidates; 4 |
 | R-25 | A candidate past its validity bound MUST become `Rejected(stale)` or `Rejected(expired)`; no `outstanding` entry is required for it. | 2, candidates |
 | R-26 | `available` MUST exclude every booked coin for every observer; `held` MUST be reported per scope and only for the requesting scope's holds; expected coins of candidates MUST NOT be counted in `pending`. | 1 |
 | R-27 | Every balance reported to a scope MUST be computed by the same function regardless of who owns the pins. | 2, privacy 3 |
 | R-28 | Hold identifiers, notes, scope identity and the existence of other holds MUST NOT appear in transactions, offer files, dApp-visible history, logs or errors. | 2, privacy 4 |
-| R-29 | The wallet user interface SHOULD show, for every hold, the owning scope, amount, mode, expiry and candidate count, and let the user release it. | 2, privacy 5 |
+| R-29 | The wallet user interface SHOULD show, for every hold, the owning scope, amount, expiry and candidate count, and let the user drop it. | 2, privacy 5 |
 | R-30 | A held offer MUST be built through `spend` with an authorization; pure shielded candidates MUST contain no intent; candidates with unshielded inputs or Dust spends MUST carry one intent with a randomly chosen segment id and a TTL. | 4 |
 | R-31 | `force: true` on `detach_transaction` MUST suppress the `outstanding` entry; the wallet MAY record the caller's assertion in history and MAY require the wallet user's confirmation when the request comes from a scope. | 3.2 |
 
@@ -458,10 +455,10 @@ Each scenario names the requirements it exercises. Coin X is a final 150 NIGHT s
 | C-08b | C-08 | M repeats both detach calls | no change (idempotent) | R-21 |
 | C-09 | C-08 | the marketplace settles B anyway | X `Spent`; B `Rejected → Confirmed`; recorded as settled after release | R-18 |
 | C-10 | C-08 | user makes an ordinary transfer that selects X and it confirms | outstanding entries dropped, warning gone; A, B, C can never settle | R-22 |
-| C-11 | C-02 | root retention passes and M holds no reservation | A, B, C `Rejected(stale)`, references pruned, X returns to `Final` with no outstanding entry; a new build with `use: "r7"` recreates the hold and pins X again without user prompt | R-23, R-24, R-25, R-11 |
+| C-11 | C-02 | root retention passes and M holds no reservation | A, B, C `Rejected(stale)`, references pruned, X returns to `Final` with no outstanding entry; a new build with `use: "r7"` recreates the hold and pins X again without user prompt; no bound or network parameter was exposed to M | R-23, R-24, R-25, R-11 |
 | C-12 | hold (M,"u1") over unshielded UTxOs | M builds candidate U with intent TTL T; T passes | U's bound is T; U becomes `Rejected(expired)`, its reference pruned, no outstanding entry | R-23, R-24, R-25, R-30 |
-| C-13 | hold (M,"f1") with pinned NIGHT and pinned Dust | M builds with `use: "f1"`, `payFees=true` | the Dust spend uses the pinned Dust output first; the candidate carries one intent | R-10, R-30 |
-| C-14 | hold (M,"s1") with mode `single`, live candidate E | M builds with `use: "s1"` | refused; after E settles, is detached or goes stale, accepted | R-11 |
+| C-13 | hold (M,"f1") with pinned NIGHT and pinned Dust | M builds with `use: "f1"`, `payFees=true` | the Dust spend uses the pinned Dust output first; the candidate carries one intent; fee sharing with the settler is not the wallet's concern | R-10, R-30 |
+| C-14 | hold (M,"h0") confirmed by the user at its first build | M builds four more candidates with `use: "h0"` | all accepted without a further prompt | R-11 |
 | C-14a | X final | M calls `hold("h1", 100 NIGHT, expires_at = +10 min)` and builds nothing | X `Booked{holds:{(M,h1)→{reservation}}}`; at +10 min the reservation is pruned and X returns to `Final` with no outstanding entry | R-13, R-23 |
 | C-15 | any holds | wallet restarts | identical holds, records and balances; ordinary selection still excludes pinned coins | R-14 |
 | C-16 | persisted hold state corrupted | wallet restarts | ordinary spends refused until the user restores or acknowledges a reset | R-14 |
