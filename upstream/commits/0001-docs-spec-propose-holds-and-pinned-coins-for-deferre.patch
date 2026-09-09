@@ -1,0 +1,566 @@
+From 9bf4fd446b1ebadc37d87b64d9e07644d4e97146 Mon Sep 17 00:00:00 2001
+From: Eddie <edward.alvarado@midnight.foundation>
+Date: Tue, 8 Sep 2026 10:51:21 -0300
+Subject: [PATCH 1/6] docs(spec): propose holds and pinned coins for deferred,
+ mutually exclusive offers
+
+Adds a wallet-local hold model to the Wallet Specification: a Pinned coin
+state between Final and Booked, a Detached transaction status, the
+operations hold / detach_transaction / release_hold, an authorization on
+spend, per-scope held balances, privacy rules for holds, and a
+'Prepare a held offer (bid)' building stage. Lifecycle diagrams updated.
+---
+ docs/spec/Specification.md    | 281 +++++++++++++++++++++++++++++++++-
+ docs/spec/coin-lifecycle.puml |   9 ++
+ docs/spec/coin-lifecycle.svg  |  50 +-----
+ docs/spec/tx-lifecycle.puml   |   6 +
+ docs/spec/tx-lifecycle.svg    |   2 +-
+ 5 files changed, 292 insertions(+), 56 deletions(-)
+
+diff --git a/docs/spec/Specification.md b/docs/spec/Specification.md
+index f30fd3b..c9dfb32 100644
+--- a/docs/spec/Specification.md
++++ b/docs/spec/Specification.md
+@@ -67,6 +67,12 @@ This document comprises a couple of sections:
+     - [Mint claim](#mint-claim)
+   - [State management](#state-management)
+     - [Balances](#balances)
++    - [Holds and pinned coins](#holds-and-pinned-coins)
++      - [Scopes](#scopes)
++      - [Hold structure](#hold-structure)
++      - [Candidate transactions](#candidate-transactions)
++      - [Coin and transaction lifecycle with holds](#coin-and-transaction-lifecycle-with-holds)
++      - [Privacy of holds](#privacy-of-holds)
+     - [Operations](#operations)
+       - [`apply_transaction`](#apply_transaction)
+         - [Steps to apply shielded offer of a section](#steps-to-apply-shielded-offer-of-a-section)
+@@ -78,6 +84,9 @@ This document comprises a couple of sections:
+       - [`discard_transaction`](#discard_transaction)
+       - [`spend`](#spend)
+       - [`watch_for`](#watch_for)
++      - [`hold`](#hold)
++      - [`detach_transaction`](#detach_transaction)
++      - [`release_hold`](#release_hold)
+   - [Synchronization process](#synchronization-process)
+     - [Indexing service for shielded tokens](#indexing-service-for-shielded-tokens)
+     - [Indexing service for unshielded tokens](#indexing-service-for-unshielded-tokens)
+@@ -100,6 +109,7 @@ This document comprises a couple of sections:
+     - [Building stages](#building-stages)
+       - [Prepare transfer](#prepare-transfer)
+       - [Prepare a swap](#prepare-a-swap)
++      - [Prepare a held offer (bid)](#prepare-a-held-offer-bid)
+       - [Contract call](#contract-call)
+       - [Balance transaction](#balance-transaction)
+   - [Transaction submission](#transaction-submission)
+@@ -516,6 +526,10 @@ Because a transaction can always be extended (by adding new intents or merging s
+ reliable identifier to use when looking for transaction confirmation. Instead, transactions should be identified by
+ their known components: value commitments of shielded offers or binding commitments of intents.
+ 
++This property is what makes *held offers* possible (see [Holds and pinned coins](#holds-and-pinned-coins)): a wallet
++can build a proven, bound and purposefully unbalanced transaction, hand it to another party, and still recognize it
++later inside whatever larger transaction that party eventually submits.
++
+ ### Mint claim
+ 
+ A system transaction can be issued by Midnight nodes to mint certain amount of tokens as a reward a party. Such minted
+@@ -541,6 +555,8 @@ consists of the data needed to spend coins and pay fees
+ - a set of own Dust outputs paired with Dust actions containing them
+ - a Merkle tree of Dust generation infos
+ - a Merkle tree of Dust commitments
++- a set of holds - scoped reservations of own coins, together with the candidate transactions built from them (see
++  [Holds and pinned coins](#holds-and-pinned-coins))
+ 
+ Owned coins do not have to be spendable at particular point. They might also be coins that the wallet was let know of,
+ which are expected to be included in one of the future transactions.
+@@ -548,7 +564,7 @@ which are expected to be included in one of the future transactions.
+ Additionally, it is in practice important to track progress of synchronization with chain, pool of pending transactions
+ and transaction history.
+ 
+-There are 6 foundational operations defined, which should be atomic to whole wallet state:
++There are 9 foundational operations defined, which should be atomic to whole wallet state:
+ 
+ - `apply_transaction(transaction, status, timestamp, expected_roots,  genearations_tree_update)` - which updates the
+   state with a transaction observed on chain, this operation allows to learn about incoming tokens
+@@ -556,8 +572,14 @@ There are 6 foundational operations defined, which should be atomic to whole wal
+ - `finalize_transaction(transaction)` - which marks transaction as final according to consensus rules
+ - `rollback_last_transaction` - which reverts effects of applying last transaction
+ - `discard_transaction(transaction)` - which considers a pending transaction irreversibly failed
+-- `spend(coins_to_spend, new_coins)` - which spends coins in a new transaction
++- `spend(coins_to_spend, new_coins, authorization)` - which spends coins in a new transaction; with an
++  `authorization` it may also spend coins pinned by a hold
+ - `watch_for(coin)` - which adds a coin to explicitly watch for
++- `hold(scope, selection, policy)` - which pins coins into a scoped hold, so that only builds authorized by that hold
++  can spend them
++- `detach_transaction(transaction, hold)` - which hands a built transaction off to the hold's scope as a candidate,
++  releasing its booking while keeping its inputs pinned
++- `release_hold(hold, scope)` - which ends a hold, returning its pinned coins to ordinary use
+ 
+ Functions `apply_transaction`, `finalize_transaction` and `rollback_transaction` can be extended to blocks, ranges of
+ blocks or other data to reconstruct the wallet state. Since shielded tokens are implemented using effectively a UTxO
+@@ -590,11 +612,147 @@ distinct balances recognized:
+ - total - sum of available and pending balances; it represents total amount of tokens under wallet's control, taking
+   into consideration known pending transactions and coins
+ 
++When holds are supported (see [Holds and pinned coins](#holds-and-pinned-coins)) a fourth balance exists, and the
++definitions above are refined as follows:
++
++- available - derived from final unspent coins that are **not pinned**; pinned coins are excluded from the available
++  balance for every observer, including the scope that owns the hold, because they can only be spent through an
++  explicitly authorized build
++- held - derived from pinned coins; it is reported **per scope**: an observer sees only the held balance of the holds
++  its own scope owns, the wallet user sees the held balance of all holds
++- pending - as above, except that outputs expected from *candidate* transactions (see below) are not counted, because
++  candidates in one hold are usually mutually exclusive and at most one of them will settle
++- total - available + pending + held (for the wallet user); for a scope it is available + pending + held of that scope
++
++A consequence of the definitions is that a scope which does not own a hold cannot distinguish a pinned coin from a
++spent one: both are simply absent from the available balance it is shown.
++
+ Because of need to book coins for ongoing transactions, coin lifecycle differs from transaction lifecycle as presented
+ on the figure below:
+ 
+ ![](./coin-lifecycle.svg)
+ 
++### Holds and pinned coins
++
++The booking described above is deliberately narrow: a coin is booked for exactly one transaction, and it is released
++the moment that transaction is discarded. This is sufficient when the wallet is the party that submits the
++transaction. It is not sufficient for a growing class of interactions where the wallet **builds** a transaction but
++somebody else **submits** it, possibly much later and possibly merged with other transactions - the swap and
++order-book style workflows Zswap was designed for. Two concrete examples:
++
++- a marketplace where the user bids on several products with the same funds; the marketplace settles whichever bid is
++  accepted first, and the other bids must simply become invalid;
++- a launch platform where the user commits funds to several new tokens at once; whichever token reaches its goal
++  first executes the user's offer and takes the funds, the others never execute.
++
++In both cases the user wants to construct several unbalanced, proven and bound shielded offers **from the same
++coins**, hand them to the application, and be sure that:
++
++1. an unrelated transfer made in the meantime (from the same wallet, or requested by another application) does not
++   consume those coins and thereby silently invalidate every offer;
++2. when one offer settles on chain, the wallet recognizes it, marks the coins spent and the sibling offers as
++   invalidated;
++3. no application other than the one the offers were built for learns that the coins are reserved, what they are
++   reserved for, or how many offers exist.
++
++A **hold** is the wallet-local construct that provides these guarantees. It never touches the ledger: pinning is purely
++a wallet policy on coin selection, and the only on-chain effect ever produced is the transaction that finally spends
++the coins.
++
++#### Scopes
++
++A hold is owned by a **scope**. A scope identifies *on whose behalf* the wallet reserved the coins and is derived by
++the wallet itself - it MUST NOT be supplied or overridable by the requesting party. The wallet defines at least:
++
++- the wallet user's own scope (`self`), used for holds created through the wallet's own user interface;
++- one scope per connected application, keyed by the application's authenticated identity together with the wallet
++  identifier and network identifier. In a browser deployment the authenticated identity is the exact web origin
++  (scheme, host and port) of the page the connection was granted to.
++
++Scopes are the privacy boundary of holds: everything a hold contains is visible to its owning scope and to the wallet
++user, and to nobody else (see [Privacy of holds](#privacy-of-holds)).
++
++#### Hold structure
++
++A hold consists of:
++
++- an identifier, opaque and unique within the wallet; identifiers MUST NOT be derived from coin data
++- the owning scope
++- the set of **pinned coins** - own, final coins reserved by the hold; a coin belongs to at most one hold at a time
++- the set of **candidate transactions** built from the hold (see below)
++- a policy:
++  - `expires_at` - wall-clock instant after which the hold is released automatically; the wallet MAY cap it
++  - optional application metadata: a `tag` (short label the application uses to find the hold again) and a free
++    `note`; both are stored, never interpreted, and never leave the owning scope
++- creation time and, for auditing by the user, the identity that requested it
++
++Pinned coins are **final** coins: they remain fully spendable from the ledger's point of view. What changes is only the
++wallet's willingness to select them: an ordinary spend MUST never select a pinned coin, and a build authorized by hold
++`H` MAY select only coins pinned by `H` (plus, if the build needs more value, ordinary unpinned coins, which are then
++added to `H`).
++
++#### Candidate transactions
++
++A **candidate** is a transaction the wallet built from a hold and handed off to the hold's scope instead of submitting
++it. Typically it is a pure shielded offer - proven, bound, unbalanced on purpose, with `payFees` disabled - but a
++candidate may also carry intents (for unshielded inputs or Dust) when the use case allows it. The wallet keeps, for
++every candidate:
++
++- its identifying components: input nullifiers, output coin commitments, and the value commitments of its shielded
++  offers (transaction hashes are not stable, see [Standard transactions](#standard-transactions))
++- the coins it would create for the wallet (change and expected received tokens), so that they can be recognized when
++  the candidate settles; they are tracked like `watch_for` coins but reported separately (see Balances)
++- the validity bound the wallet can compute locally:
++  - for shielded inputs, the commitment-tree root the input proofs were built against; the ledger accepts a root only
++    while it is within its root retention window (a ledger parameter - `global_ttl`, one hour by default), so a
++    candidate is *stale* once that window has passed and must be rebuilt from the hold to remain usable
++  - for intents, the smallest intent TTL
++- a status: `detached` (live, handed off), `settled` (observed on chain), `invalidated` (one of its inputs was spent
++  by another transaction, e.g. a sibling candidate), `stale` (validity bound passed), `released` (hold released).
++
++Candidates in one hold that share an input nullifier form a **conflict group**: at most one of them can ever settle.
++This is exactly the property the bidding use cases rely on, and it is visible to the owning scope, which needs it in
++order not to merge two conflicting candidates into one settlement (the ledger would reject the double spend and the
++whole guaranteed section with it).
++
++#### Coin and transaction lifecycle with holds
++
++Holds add one coin state and one transaction status:
++
++- coin `Pinned` - a final coin reserved by a hold; not part of the available balance, part of the owning scope's held
++  balance. Transitions: `final -> pinned` on `hold`; `pinned -> booked` on an authorized `spend`;
++  `booked -> pinned` on `detach_transaction`; `pinned -> final` on `release_hold` or hold expiry;
++  `pinned -> spent` on `apply` of any transaction carrying the coin's nullifier; `spent -> pinned` on `rollback` of a
++  transaction that matched a candidate.
++- transaction `Detached` - a candidate handed off to a scope. It is not in the pending pool and the wallet never
++  submits or re-submits it. Transitions: `detached -> confirmed` on `apply` (the candidate record becomes `settled`);
++  `detached -> invalidated | stale | released` as described above.
++
++The full lifecycles are shown on the two figures referenced in this section; the `Pinned` state and the `Detached`
++status are part of them.
++
++#### Privacy of holds
++
++Holds exist to let one application coordinate mutually exclusive offers without telling any other application that the
++coordination is happening. The wallet MUST therefore guarantee:
++
++1. Holds, their metadata, their candidates and their conflict groups are retrievable only by the owning scope and the
++   wallet user.
++2. A request from scope `A` that names a hold, tag or candidate belonging to scope `B` MUST produce exactly the result
++   that a non-existent hold, tag or candidate would produce - same error, same shape, same timing class.
++3. Every balance the wallet reports to a scope is computed by the same function regardless of who owns the pins;
++   the only information a non-owning scope can obtain is that the available balance is lower, which is
++   indistinguishable from an ordinary spend.
++4. Candidates handed to a scope contain only ledger data. Hold identifiers, tags, notes, scope identity and the
++   existence of other holds MUST NOT be embedded in transactions, offer files, transaction history entries exposed to
++   applications, logs or error messages.
++5. The wallet user interface SHOULD show, for every hold, the scope (origin) that owns it, so that the user can audit
++   and release holds regardless of what the owning application does.
++
++Note that the ledger data inside a candidate reveals its input nullifiers to whoever receives it. This is inherent to
++Zswap offers and is limited to the scope the candidate was built for; it is also what allows that scope to detect
++conflicts between its own candidates.
++
+ ### Operations
+ 
+ #### `apply_transaction`
+@@ -621,7 +779,11 @@ fallible section.
+ 1. Update coin commitment tree with commitments of outputs and transients present in the offer
+ 2. Verify obtained coin commitment tree root against provided one, implementation needs to revert updates to coin
+    commitment tree and abort in case of inconsistency
+-3. Book coins, whose nullifiers match the ones present in offer inputs
++3. Book coins, whose nullifiers match the ones present in offer inputs; if a matched coin is pinned:
++   1. Find the candidate of its hold whose identifying components (value commitments, output commitments) are present
++      in the transaction; if one is found, mark it `settled` and confirm the coins it was expected to create
++   2. Mark every other candidate of the hold that uses the same nullifier as `invalidated`
++   3. If the hold has no pinned coins left, close it
+ 4. Watch for received coins, for each output:
+    1. Match commitment with a set of pending coins, if there is a match, mark the matching pending coin as confirmed
+    2. If commitment is not a match, try to decrypt output ciphertext, if decryption succeeds - add coin to known set as
+@@ -630,7 +792,8 @@ fallible section.
+ 
+ ##### Steps to apply unshielded offer of a section
+ 
+-1. Book coins spent in the inputs. Find matching Dust generation infos and set their spent time to timestamp provided
++1. Book coins spent in the inputs; for pinned coins apply the same candidate settlement rules as for shielded inputs.
++   Find matching Dust generation infos and set their spent time to timestamp provided
+ 2. Filter outputs to narrow them down to only ones received by tracked addresses, for each one:
+    1. Match the coin with pending ones, if there is a match, mark the matching pending coin as confirmed.
+    2. Otherwise, add a coin to the known set as a confirmed.
+@@ -690,7 +853,10 @@ It needs to:
+    3. Restore coins spent in the transaction in a booked state
+    4. Undo setting timestamp on Dust generation info related to Night UTxOs spent in the transaction
+    5. Remove related Dust generation info
+-3. Otherwise, discard transaction
++3. If transaction settled a candidate: return the candidate to `detached`, restore its inputs as pinned, move the coins
++   it created back to expected ones and restore the sibling candidates it invalidated (they were invalidated only by
++   this transaction)
++4. Otherwise, discard transaction
+ 
+ There are a couple of practical considerations:
+ 
+@@ -706,9 +872,13 @@ giving up on submitting one. Following steps need to be taken:
+ 
+ 1. Move transaction to transaction history as failed
+ 2. Remove coins received in the transaction
+-3. Un-book coins spent in the transaction
++3. Un-book coins spent in the transaction; a coin that was booked from a hold returns to `pinned`, not to `final`
+ 4. Remove related Dust generation info
+ 
++Discarding applies to transactions in the pending pool. Candidates are not discarded - they are released together
++with their hold (`release_hold`), or become `invalidated` or `stale` as described in
++[Candidate transactions](#candidate-transactions).
++
+ #### `spend`
+ 
+ Spend coins in a transaction, either by initiating swap, making transfer or balancing other transaction. Only final
+@@ -718,12 +888,23 @@ In certain situations implementation might allow to use confirmed and yet not fi
+ fail in case of reorganization because of coin commitment tree root mismatch, so a special care should be put into user
+ experience of managing such transactions.
+ 
++The operation takes an optional `authorization`, naming a hold and the scope requesting the spend. Without it, the
++spend is *ordinary*: pinned coins are never eligible for selection, and if the unpinned funds are insufficient the
++operation fails with an insufficient-funds error that does not reveal whether pinned funds would have covered the
++shortage. With an authorization, the wallet MUST verify that the scope owns the hold, and then coin selection MUST
++prefer the hold's pinned coins; unpinned final coins MAY be added when the hold does not cover the request, and every
++such coin is atomically pinned into the same hold. Coins pinned by any other hold remain ineligible.
++
+ Following steps need to be taken, from perspective of wallet state:
+ 
+ 1. Select coins to use in transaction and book them
+ 2. Prepare change outputs, add them to pending coin pool
+ 3. Prepare transaction, add it to pending transaction pool
+ 
++A transaction built with an authorization stays in the pending pool like any other until the wallet either submits it
++or hands it off with `detach_transaction`. Selection, pinning and booking MUST happen in one atomic step, so that two
++concurrent builds cannot pin or book the same coin.
++
+ #### `watch_for`
+ 
+ Watches for a coin whose details are provided. There are limitations, which require usage of this operation to receive
+@@ -735,6 +916,64 @@ transaction history with "expected" status.
+ Note: in many cases such transaction would be requested to be balanced, in such case the final transaction should only
+ be added as pending one.
+ 
++#### `hold`
++
++Creates a hold for a scope (see [Holds and pinned coins](#holds-and-pinned-coins)). Parameters:
++
++- the requesting scope, derived by the wallet
++- a selection: either explicit references to own final coins, or a map of token type to amount, in which case the
++  wallet selects final, unpinned coins covering each amount using its ordinary coin selection
++- a policy: `expires_at`, optional `tag` and `note`
++
++Steps:
++
++1. Resolve the selection to a set of own **final, unpinned** coins; fail if it cannot be satisfied (the error MUST NOT
++   reveal whether coins pinned by other holds would have satisfied it)
++2. Validate the policy against wallet limits (maximum duration, maximum number of holds per scope, metadata size)
++3. Atomically create the hold, mark the coins `pinned`, and persist
++4. Return the hold identifier
++
++Holds MUST be persisted with the rest of the wallet state and MUST be restored before any spend is allowed after a
++restart. If the persisted hold state cannot be read or validated, the wallet MUST refuse ordinary spends rather than
++treat the coins as unpinned.
++
++A wallet MAY require user confirmation for creating a hold, exactly as it may for any spend; a hold is a commitment of
++funds and SHOULD be presented as such (amount, token type, requesting scope, expiry).
++
++#### `detach_transaction`
++
++Hands a transaction built with an authorization off to the hold's scope as a candidate. It is the counterpart of
++`discard_transaction` for the case where the wallet is *not* the submitter. Steps:
++
++1. Verify the transaction is in the pending pool and was built under an authorization for the given hold
++2. Record the candidate: identifying components, coins it would create, validity bound, status `detached`
++3. Remove the transaction from the pending pool; un-book its inputs so that they return to `pinned`; move the coins
++   it would create from the pending set to the candidate's expected set
++4. Any unpinned coin the build had to add is already pinned in the hold (see `spend`); verify this invariant
++5. Persist atomically, then return the serialized transaction to the scope
++
++After `detach_transaction` the same coins can be used again by another authorized build for the same hold, which is
++how several mutually exclusive candidates are produced from one set of coins. The wallet SHOULD warn the user, when
++presenting a hold, that candidates are outside the wallet's control: they may be submitted by the scope at any time
++before they become stale, and local release does not revoke them.
++
++#### `release_hold`
++
++Ends a hold. Steps:
++
++1. Verify the scope owns the hold (or the request comes from the wallet user)
++2. Mark every candidate `released`
++3. Return every pinned coin of the hold with no live booking to `final`
++4. Persist atomically
++
++The wallet MUST make it clear that released candidates may still be valid on chain until their validity bound passes
++or their inputs are spent. A scope or user that needs a guarantee that no candidate can settle any more MUST spend the
++coins (for example, to the wallet itself) after the release; the wallet MAY offer this as a "cancel" convenience that
++performs the release and the self-transfer together.
++
++A hold whose `expires_at` has passed is released automatically. Expiry is evaluated against the wallet clock and
++SHOULD include the same latency margin used for TTL handling.
++
+ ## Synchronization process
+ 
+ Literal implementation of a Midnight Wallet, applying transactions one by one, provided by a local node is the best
+@@ -1074,6 +1313,33 @@ The resulting transaction will only have outputs to be received defined, with no
+ balancing the transaction must be employed before the swap offer is ready to be submitted, with proper target imbalances
+ indicated.
+ 
++#### Prepare a held offer (bid)
++
++A held offer is a swap prepared from a hold, so that the wallet can hand it off and still keep the coins reserved. It
++is the building block of the bidding use cases described in [Holds and pinned coins](#holds-and-pinned-coins). Given a
++hold `H` (created with `hold`, or created implicitly by this operation when the caller asks for a fresh one), the
++token amounts to provide and the token amounts to receive:
++
++1. Create expected outputs for each token type to be received, addressed to the wallet itself. The wallet MAY have
++   never held that token type (e.g. a token that will be minted by the settling contract); an output does not require
++   prior ownership of its token type.
++2. Combine them into a guaranteed shielded offer skeleton with target imbalances equal to the amounts to provide.
++3. Balance the skeleton with `spend` authorized by `H` and with fee payment disabled: inputs come from the pinned
++   coins of `H`, change is addressed to the wallet.
++4. Prove and bind. The result is a transaction consisting of a single guaranteed shielded offer, mergeable by any
++   party.
++5. `detach_transaction` it into `H` and return it to the caller.
++
++Repeating steps 1-5 with different target imbalances or recipients produces sibling candidates from the same coins.
++Because each candidate's input proofs are bound to the commitment-tree root at build time, candidates must be rebuilt
++when the root leaves the ledger's retention window; the caller SHOULD be told the validity bound together with the
++candidate.
++
++Fees are intentionally not covered by a held offer: the party that merges the candidates into the settlement
++transaction balances it and pays Dust. A held offer that must also carry Dust would need an intent with a Dust spend,
++whose timing constraints (Dust grace period) are much tighter than the hold; such offers are out of scope of this
++stage.
++
+ #### Contract call
+ 
+ Contract calls are prepared by other components than wallet. Once ready, in most cases an unbalanced transaction would
+@@ -1141,6 +1407,9 @@ Conceptually, the process follows given steps:
+ 
+ Once transaction is created, it can be submitted to the network or other party.
+ 
++Detached candidates (see [`detach_transaction`](#detach_transaction)) are never submitted by the wallet; the scope
++that received them is responsible for submission, usually after merging them with other transactions.
++
+ For cases, where the wallet submits a transaction to the network, it is advised that the wallet implements a
+ re-submission mechanism. A blockchain is a distributed system and there are many possible issues, which may arise due
+ to, among others, networking problems such as a node being temporarily unavailable, the network being congested or a
+diff --git a/docs/spec/coin-lifecycle.puml b/docs/spec/coin-lifecycle.puml
+index 10d6608..7915857 100644
+--- a/docs/spec/coin-lifecycle.puml
++++ b/docs/spec/coin-lifecycle.puml
+@@ -3,23 +3,32 @@
+ state pending as "Pending": Coin expected to be received\nPart of pending balance
+ state confirmed as "Confirmed": Coin received in a transaction added to the chain\nPart of pending balance
+ state final as "Final": Coin received in a finalized transaction\nPart of available balance
++state pinned as "Pinned": Final coin reserved by a hold\nNot part of available balance\nPart of the owning scope's held balance
+ state booked as "Booked": Coin booked for a transaction\nNot part of balance
+ state spent as "Spent" : Coin that was spent in a transaction\nNot part of balance
+ 
+ [*] --> confirmed : apply(receive)
+ [*] --> pending : spend
+ [*] --> pending : watch_for
++[*] --> pending : detach_transaction (expected, not counted)
+ pending --> confirmed : apply(receive)
+ confirmed --> final : finalize
+ confirmed --> pending : rollback
+ confirmed --> [*] : discard
+ final --> booked : spend|apply(spend)
++final --> pinned : hold
++pinned --> booked : spend(authorization)
++pinned --> final : release_hold | expiry
++pinned --> spent : apply(spend)
+ 
+ booked --> spent : apply
+ booked --> booked : rollback
+ booked --> final : discard
++booked --> pinned : discard (booked from hold)
++booked --> pinned : detach_transaction
+ pending --> [*] : discard
+ spent --> booked : rollback
++spent --> pinned : rollback (settled candidate)
+ spent --> spent : finalize
+ 
+ @enduml
+diff --git a/docs/spec/coin-lifecycle.svg b/docs/spec/coin-lifecycle.svg
+index c3f485e..3697da8 100644
+--- a/docs/spec/coin-lifecycle.svg
++++ b/docs/spec/coin-lifecycle.svg
+@@ -1,49 +1 @@
+-<?xml version="1.0" encoding="UTF-8" standalone="no"?><svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" contentStyleType="text/css" height="762px" preserveAspectRatio="none" style="width:503px;height:762px;background:#FFFFFF;" version="1.1" viewBox="0 0 503 762" width="503px" zoomAndPan="magnify"><defs/><g><g id="pending"><rect fill="#F1F1F1" height="69.4648" rx="12.5" ry="12.5" style="stroke:#181818;stroke-width:0.5;" width="219" x="26.77" y="103"/><line style="stroke:#181818;stroke-width:0.5;" x1="26.77" x2="245.77" y1="129.4883" y2="129.4883"/><text fill="#000000" font-family="sans-serif" font-size="14" lengthAdjust="spacing" textLength="56" x="108.27" y="121.5352">Pending</text><text fill="#000000" font-family="sans-serif" font-size="14" lengthAdjust="spacing" textLength="199" x="31.77" y="148.0234">Coin expected to be received</text><text fill="#000000" font-family="sans-serif" font-size="14" lengthAdjust="spacing" textLength="163" x="31.77" y="164.5117">Part of pending balance</text></g><g id="confirmed"><rect fill="#F1F1F1" height="69.4648" rx="12.5" ry="12.5" style="stroke:#181818;stroke-width:0.5;" width="355" x="94.77" y="249"/><line style="stroke:#181818;stroke-width:0.5;" x1="94.77" x2="449.77" y1="275.4883" y2="275.4883"/><text fill="#000000" font-family="sans-serif" font-size="14" lengthAdjust="spacing" textLength="73" x="235.77" y="267.5352">Confirmed</text><text fill="#000000" font-family="sans-serif" font-size="14" lengthAdjust="spacing" textLength="335" x="99.77" y="294.0234">Coin received in a transaction added to the chain</text><text fill="#000000" font-family="sans-serif" font-size="14" lengthAdjust="spacing" textLength="163" x="99.77" y="310.5117">Part of pending balance</text></g><g id="final"><rect fill="#F1F1F1" height="69.4648" rx="12.5" ry="12.5" style="stroke:#181818;stroke-width:0.5;" width="286" x="129.27" y="395"/><line style="stroke:#181818;stroke-width:0.5;" x1="129.27" x2="415.27" y1="421.4883" y2="421.4883"/><text fill="#000000" font-family="sans-serif" font-size="14" lengthAdjust="spacing" textLength="33" x="255.77" y="413.5352">Final</text><text fill="#000000" font-family="sans-serif" font-size="14" lengthAdjust="spacing" textLength="266" x="134.27" y="440.0234">Coin received in a finalized transaction</text><text fill="#000000" font-family="sans-serif" font-size="14" lengthAdjust="spacing" textLength="166" x="134.27" y="456.5117">Part of available balance</text></g><g id="booked"><rect fill="#F1F1F1" height="69.4648" rx="12.5" ry="12.5" style="stroke:#181818;stroke-width:0.5;" width="225" x="158.77" y="541"/><line style="stroke:#181818;stroke-width:0.5;" x1="158.77" x2="383.77" y1="567.4883" y2="567.4883"/><text fill="#000000" font-family="sans-serif" font-size="14" lengthAdjust="spacing" textLength="51" x="245.77" y="559.5352">Booked</text><text fill="#000000" font-family="sans-serif" font-size="14" lengthAdjust="spacing" textLength="205" x="163.77" y="586.0234">Coin booked for a transaction</text><text fill="#000000" font-family="sans-serif" font-size="14" lengthAdjust="spacing" textLength="131" x="163.77" y="602.5117">Not part of balance</text></g><g id="spent"><rect fill="#F1F1F1" height="69.4648" rx="12.5" ry="12.5" style="stroke:#181818;stroke-width:0.5;" width="265" x="138.77" y="687"/><line style="stroke:#181818;stroke-width:0.5;" x1="138.77" x2="403.77" y1="713.4883" y2="713.4883"/><text fill="#000000" font-family="sans-serif" font-size="14" lengthAdjust="spacing" textLength="39" x="251.77" y="705.5352">Spent</text><text fill="#000000" font-family="sans-serif" font-size="14" lengthAdjust="spacing" textLength="245" x="143.77" y="732.0234">Coin that was spent in a transaction</text><text fill="#000000" font-family="sans-serif" font-size="14" lengthAdjust="spacing" textLength="131" x="143.77" y="748.5117">Not part of balance</text></g><ellipse cx="216.27" cy="16" fill="#222222" rx="10" ry="10" style="stroke:none;stroke-width:1.0;"/><ellipse cx="48.27" cy="429.5" fill="none" rx="10" ry="10" style="stroke:#222222;stroke-width:1.0;"/><ellipse cx="48.77" cy="430" fill="#222222" rx="6" ry="6" style="stroke:none;stroke-width:1.0;"/><!--MD5=[2f510e666f67c9c7db9cedbb83d33df7]
+-link *start to confirmed--><g id="link_*start_confirmed"><path d="M224.65,22.31 C234.55,29 250.87,41.41 260.27,56 C297.04,113.08 295.16,134.86 305.27,202 C306.4,209.47 307.06,211.66 305.27,219 C303.3,227.08 300.1,235.27 296.45,242.97 " fill="none" id="*start-to-confirmed" style="stroke:#181818;stroke-width:1.0;"/><polygon fill="#181818" points="294.26,247.4,301.8305,241.1003,296.4732,242.9165,294.6569,237.5591,294.26,247.4" style="stroke:#181818;stroke-width:1.0;"/><text fill="#000000" font-family="sans-serif" font-size="13" lengthAdjust="spacing" textLength="86" x="302.27" y="142.5684">apply(receive)</text></g><!--MD5=[1938bc6a853a11b9ef2efe3ae926af70]
+-link *start to pending--><g id="link_*start_pending"><path d="M206.09,18.3 C187.75,21.25 149.57,30.33 133.27,56 C125.73,67.88 124.58,82.85 125.96,96.65 " fill="none" id="*start-to-pending" style="stroke:#181818;stroke-width:1.0;"/><polygon fill="#181818" points="126.57,101.39,129.3793,91.9503,125.927,96.4315,121.4458,92.9792,126.57,101.39" style="stroke:#181818;stroke-width:1.0;"/><text fill="#000000" font-family="sans-serif" font-size="13" lengthAdjust="spacing" textLength="38" x="134.27" y="69.5684">spend</text></g><!--MD5=[1938bc6a853a11b9ef2efe3ae926af70]
+-link *start to pending--><g id="link_*start_pending"><path d="M211.02,24.84 C201.28,39.4 179.8,71.48 162.35,97.54 " fill="none" id="*start-to-pending-1" style="stroke:#181818;stroke-width:1.0;"/><polygon fill="#181818" points="159.76,101.41,168.093,96.1601,162.5434,97.2563,161.4472,91.7067,159.76,101.41" style="stroke:#181818;stroke-width:1.0;"/><text fill="#000000" font-family="sans-serif" font-size="13" lengthAdjust="spacing" textLength="62" x="189.27" y="69.5684">watch_for</text></g><!--MD5=[ebcf6dbfe2a2f920bd60ed608d75eebb]
+-link pending to confirmed--><g id="link_pending_confirmed"><path d="M168.16,172.26 C188.53,193.84 215.01,221.87 236.16,244.26 " fill="none" id="pending-to-confirmed" style="stroke:#181818;stroke-width:1.0;"/><polygon fill="#181818" points="239.55,247.85,236.2752,238.5615,236.1156,244.2161,230.461,244.0565,239.55,247.85" style="stroke:#181818;stroke-width:1.0;"/><text fill="#000000" font-family="sans-serif" font-size="13" lengthAdjust="spacing" textLength="86" x="210.27" y="215.5684">apply(receive)</text></g><!--MD5=[84a6e6579109df2776c5b9ea88122c19]
+-link confirmed to pending--><g id="link_confirmed_pending"><path d="M169.99,248.71 C157.93,240.75 147.14,230.98 139.27,219 C131.55,207.24 129.43,192.3 129.71,178.48 " fill="none" id="confirmed-to-pending" style="stroke:#181818;stroke-width:1.0;"/><polygon fill="#181818" points="129.92,173.74,125.5372,182.5599,129.7053,178.7354,133.5298,182.9035,129.92,173.74" style="stroke:#181818;stroke-width:1.0;"/><text fill="#000000" font-family="sans-serif" font-size="13" lengthAdjust="spacing" textLength="51" x="140.27" y="215.5684">rollback</text></g><!--MD5=[08c40ba825df0a82f4fa6bc0b125ff1a]
+-link confirmed to final--><g id="link_confirmed_final"><path d="M272.27,318.26 C272.27,339.3 272.27,366.46 272.27,388.56 " fill="none" id="confirmed-to-final" style="stroke:#181818;stroke-width:1.0;"/><polygon fill="#181818" points="272.27,393.44,276.27,384.44,272.27,388.44,268.27,384.44,272.27,393.44" style="stroke:#181818;stroke-width:1.0;"/><text fill="#000000" font-family="sans-serif" font-size="13" lengthAdjust="spacing" textLength="46" x="273.27" y="361.5684">finalize</text></g><!--MD5=[3600fad52994415f4c4d7ea48ac0e995]
+-link confirmed to *end--><g id="link_confirmed_*end"><path d="M219.47,318.44 C167.6,351.79 91.95,400.42 61.6,419.93 " fill="none" id="confirmed-to-*end" style="stroke:#181818;stroke-width:1.0;"/><polygon fill="#181818" points="57.75,422.41,67.4859,420.9229,61.9601,419.7127,63.1703,414.1868,57.75,422.41" style="stroke:#181818;stroke-width:1.0;"/><text fill="#000000" font-family="sans-serif" font-size="13" lengthAdjust="spacing" textLength="46" x="168.27" y="361.5684">discard</text></g><!--MD5=[021823178568b7707d3380c4e2f68a78]
+-link final to booked--><g id="link_final_booked"><path d="M210.88,464.35 C200.95,472.68 192.04,482.57 186.27,494 C178.21,509.98 185.75,524.48 199.11,536.65 " fill="none" id="final-to-booked" style="stroke:#181818;stroke-width:1.0;"/><polygon fill="#181818" points="202.7,539.7,198.4506,530.8151,198.8967,536.4543,193.2574,536.9004,202.7,539.7" style="stroke:#181818;stroke-width:1.0;"/><text fill="#000000" font-family="sans-serif" font-size="13" lengthAdjust="spacing" textLength="123" x="187.27" y="507.5684">spend|apply(spend)</text></g><!--MD5=[5e1c41f066f0d576b546afa8f8482164]
+-link booked to final--><g id="link_booked_final"><path d="M300.3,540.59 C306.43,531.53 312.03,521.37 315.27,511 C319.7,496.84 315.13,482.27 307.57,469.49 " fill="none" id="booked-to-final" style="stroke:#181818;stroke-width:1.0;"/><polygon fill="#181818" points="304.97,465.4,306.4187,475.1417,307.6507,469.6207,313.1718,470.8526,304.97,465.4" style="stroke:#181818;stroke-width:1.0;"/><text fill="#000000" font-family="sans-serif" font-size="13" lengthAdjust="spacing" textLength="46" x="317.27" y="507.5684">discard</text></g><!--MD5=[901e9184569f076a7f827bdaf352323d]
+-link booked to spent--><g id="link_booked_spent"><path d="M244.41,610.32 C238.61,619.45 233.31,629.68 230.27,640 C226.12,654.08 230.49,668.63 237.7,681.43 " fill="none" id="booked-to-spent" style="stroke:#181818;stroke-width:1.0;"/><polygon fill="#181818" points="240.17,685.5,238.9073,675.7324,237.5703,681.229,232.0737,679.892,240.17,685.5" style="stroke:#181818;stroke-width:1.0;"/><text fill="#000000" font-family="sans-serif" font-size="13" lengthAdjust="spacing" textLength="34" x="231.27" y="653.5684">apply</text></g><!--MD5=[b4e3cd3b3b4f620d7c91309b064b9802]
+-link spent to booked--><g id="link_spent_booked"><path d="M271.27,686.95 C271.27,665.96 271.27,638.79 271.27,616.66 " fill="none" id="spent-to-booked" style="stroke:#181818;stroke-width:1.0;"/><polygon fill="#181818" points="271.27,611.78,267.27,620.78,271.27,616.78,275.27,620.78,271.27,611.78" style="stroke:#181818;stroke-width:1.0;"/><text fill="#000000" font-family="sans-serif" font-size="13" lengthAdjust="spacing" textLength="51" x="272.27" y="653.5684">rollback</text></g><!--MD5=[262a8a37479eab7cd54854f87ff39543]
+-link booked to booked--><g id="link_booked_booked"><path d="M384.13,562.59 C404.51,564.25 418.77,568.55 418.77,575.5 C418.77,581.69 407.46,585.78 390.59,587.77 " fill="none" id="booked-to-booked" style="stroke:#181818;stroke-width:1.0;"/><polygon fill="#181818" points="385.64,588.26,394.9863,591.3659,390.6163,587.7738,394.2084,583.4038,385.64,588.26" style="stroke:#181818;stroke-width:1.0;"/><text fill="#000000" font-family="sans-serif" font-size="13" lengthAdjust="spacing" textLength="51" x="424.77" y="580.5684">rollback</text></g><!--MD5=[60ce465aa68d075a3a61b170d7ba18c7]
+-link pending to *end--><g id="link_pending_*end"><path d="M89.62,172.33 C66.78,191.86 41.6,218.55 29.27,249 C6,306.49 30.07,382.38 42.19,413.85 " fill="none" id="pending-to-*end" style="stroke:#181818;stroke-width:1.0;"/><polygon fill="#181818" points="44.01,418.47,44.4075,408.6292,42.1654,413.8227,36.9718,411.5806,44.01,418.47" style="stroke:#181818;stroke-width:1.0;"/><text fill="#000000" font-family="sans-serif" font-size="13" lengthAdjust="spacing" textLength="46" x="30.27" y="288.5684">discard</text></g><!--MD5=[944a748e4e2a5f0eef86b1e9d3c1a1e9]
+-link spent to spent--><g id="link_spent_spent"><path d="M403.97,708.96 C424.66,710.83 438.77,715.01 438.77,721.5 C438.77,727.33 427.38,731.3 410.06,733.4 " fill="none" id="spent-to-spent" style="stroke:#181818;stroke-width:1.0;"/><polygon fill="#181818" points="405.47,733.89,414.8425,736.916,410.442,733.3614,413.9967,728.9609,405.47,733.89" style="stroke:#181818;stroke-width:1.0;"/><text fill="#000000" font-family="sans-serif" font-size="13" lengthAdjust="spacing" textLength="46" x="444.77" y="726.5684">finalize</text></g><!--MD5=[db06249143dcfd5aa0bbe2a84dad081d]
+-@startuml
+-
+-state pending as "Pending": Coin expected to be received\nPart of pending balance
+-state confirmed as "Confirmed": Coin received in a transaction added to the chain\nPart of pending balance
+-state final as "Final": Coin received in a finalized transaction\nPart of available balance
+-state booked as "Booked": Coin booked for a transaction\nNot part of balance
+-state spent as "Spent" : Coin that was spent in a transaction\nNot part of balance
+-
+-[*] - -> confirmed : apply(receive)
+-[*] - -> pending : spend
+-[*] - -> pending : watch_for
+-pending - -> confirmed : apply(receive)
+-confirmed - -> final : finalize
+-confirmed - -> pending : rollback
+-confirmed - -> [*] : discard
+-final - -> booked : spend|apply(spend)
+-
+-booked - -> spent : apply
+-booked - -> booked : rollback
+-booked - -> final : discard
+-pending - -> [*] : discard
+-spent - -> booked : rollback
+-spent - -> spent : finalize
+-
+-@enduml
+-
+-PlantUML version 1.2022.3(Tue Mar 29 18:10:57 CEST 2022)
+-(GPL source distribution)
+-Java Runtime: OpenJDK Runtime Environment
+-JVM: OpenJDK 64-Bit Server VM
+-Default Encoding: UTF-8
+-Language: en
+-Country: PL
+---></g></svg>
+\ No newline at end of file
++<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" version="1.1" data-diagram-type="STATE" style="width:1211px;height:931px;background:#FFFFFF;" width="1211px" height="931px" viewBox="0 0 1211 931" zoomAndPan="magnify" preserveAspectRatio="none" contentStyleType="text/css"><?plantuml 1.2026.8?><defs/><g font-family="sans-serif" lengthAdjust="spacing"><g class="entity" data-qualified-name="pending" id="ent0001" data-source-line="2"><rect x="636" y="103" width="225.898" height="68.891" fill="#F1F1F1" style="stroke:#181818;stroke-width:0.5;" rx="12.5" ry="12.5"/><line x1="636" y1="129.297" x2="861.898" y2="129.297" style="stroke:#181818;stroke-width:0.5;"/><text x="720.717" y="120.995" fill="#000" font-size="14" textLength="56.465">Pending</text><text x="641" y="147.292" fill="#000" font-size="14" textLength="205.898">Coin expected to be received</text><text x="641" y="163.589" fill="#000" font-size="14" textLength="167.139">Part of pending balance</text></g><g class="entity" data-qualified-name="confirmed" id="ent0002" data-source-line="3"><rect x="745.81" y="248.89" width="366.281" height="68.891" fill="#F1F1F1" style="stroke:#181818;stroke-width:0.5;" rx="12.5" ry="12.5"/><line x1="745.81" y1="275.187" x2="1112.091" y2="275.187" style="stroke:#181818;stroke-width:0.5;"/><text x="892.488" y="266.885" fill="#000" font-size="14" textLength="72.926">Confirmed</text><text x="750.81" y="293.182" fill="#000" font-size="14" textLength="346.281">Coin received in a transaction added to the chain</text><text x="750.81" y="309.479" fill="#000" font-size="14" textLength="167.139">Part of pending balance</text></g><g class="entity" data-qualified-name="final" id="ent0003" data-source-line="4"><rect x="782.43" y="394.78" width="293.034" height="68.891" fill="#F1F1F1" style="stroke:#181818;stroke-width:0.5;" rx="12.5" ry="12.5"/><line x1="782.43" y1="421.077" x2="1075.464" y2="421.077" style="stroke:#181818;stroke-width:0.5;"/><text x="912.305" y="412.775" fill="#000" font-size="14" textLength="33.284">Final</text><text x="787.43" y="439.072" fill="#000" font-size="14" textLength="273.034">Coin received in a finalized transaction</text><text x="787.43" y="455.369" fill="#000" font-size="14" textLength="173.421">Part of available balance</text></g><g class="entity" data-qualified-name="pinned" id="ent0004" data-source-line="5"><rect x="567.17" y="540.67" width="299.556" height="85.188" fill="#F1F1F1" style="stroke:#181818;stroke-width:0.5;" rx="12.5" ry="12.5"/><line x1="567.17" y1="566.967" x2="866.726" y2="566.967" style="stroke:#181818;stroke-width:0.5;"/><text x="693.159" y="558.665" fill="#000" font-size="14" textLength="47.578">Pinned</text><text x="572.17" y="584.962" fill="#000" font-size="14" textLength="202.344">Final coin reserved by a hold</text><text x="572.17" y="601.259" fill="#000" font-size="14" textLength="202.843">Not part of available balance</text><text x="572.17" y="617.556" fill="#000" font-size="14" textLength="279.556">Part of the owning scope's held balance</text></g><g class="entity" data-qualified-name="booked" id="ent0005" data-source-line="6"><rect x="523.23" y="848.75" width="227.443" height="68.891" fill="#F1F1F1" style="stroke:#181818;stroke-width:0.5;" rx="12.5" ry="12.5"/><line x1="523.23" y1="875.047" x2="750.673" y2="875.047" style="stroke:#181818;stroke-width:0.5;"/><text x="610.78" y="866.745" fill="#000" font-size="14" textLength="52.343">Booked</text><text x="528.23" y="893.042" fill="#000" font-size="14" textLength="207.443">Coin booked for a transaction</text><text x="528.23" y="909.339" fill="#000" font-size="14" textLength="135.201">Not part of balance</text></g><g class="entity" data-qualified-name="spent" id="ent0006" data-source-line="7"><rect x="407.38" y="702.86" width="273.142" height="68.891" fill="#F1F1F1" style="stroke:#181818;stroke-width:0.5;" rx="12.5" ry="12.5"/><line x1="407.38" y1="729.157" x2="680.522" y2="729.157" style="stroke:#181818;stroke-width:0.5;"/><text x="523.576" y="720.855" fill="#000" font-size="14" textLength="40.749">Spent</text><text x="412.38" y="747.152" fill="#000" font-size="14" textLength="253.142">Coin that was spent in a transaction</text><text x="412.38" y="763.449" fill="#000" font-size="14" textLength="135.201">Not part of balance</text></g><g class="start_entity" data-qualified-name=".start." id="ent0007" data-source-line="9"><ellipse cx="748.95" cy="16" rx="10" ry="10" fill="#222" style="stroke:#222;stroke-width:1;"/></g><g class="end_entity" data-qualified-name=".end." id="ent0015" data-source-line="16"><ellipse cx="698.95" cy="429.23" rx="11" ry="11" fill="none" style="stroke:#222;stroke-width:1;"/><ellipse cx="698.95" cy="429.23" rx="6" ry="6" fill="#222" style="stroke:#222;stroke-width:1;"/></g><!--link *start* to confirmed--><g class="link" data-entity-1="ent0007" data-entity-2="ent0002" id="lnk8" data-source-line="9" data-link-type="dependency"><path d="M759.2,17.5 C810.59,20.1 1038.59,32.91 1058.95,56 C1112.16,116.32 1032.917,198.594 976.967,245.354" style="stroke:#181818;stroke-width:1;" fill="none" id="*start*-to-confirmed"/><polygon points="973.13,248.56,982.601,245.858,976.967,245.354,977.471,239.719,973.13,248.56" fill="#181818" style="stroke:#181818;stroke-width:1;stroke-linejoin:miter;stroke-miterlimit:10;"/><text x="1076.75" y="142.007" fill="#000" font-size="13" textLength="93.71">apply(receive)</text></g><!--link *start* to pending--><g class="link" data-entity-1="ent0007" data-entity-2="ent0001" id="lnk9" data-source-line="10" data-link-type="dependency"><path d="M738.86,18.33 C710.04,22.35 628.47,35.4 612.95,56 C597.43,76.59 607.19,90.631 631.4,103.031" style="stroke:#181818;stroke-width:1;" fill="none" id="*start*-to-pending"/><polygon points="635.85,105.31,629.663,97.647,631.4,103.031,626.016,104.767,635.85,105.31" fill="#181818" style="stroke:#181818;stroke-width:1;stroke-linejoin:miter;stroke-miterlimit:10;"/><text x="613.95" y="69.067" fill="#000" font-size="13" textLength="39.514">spend</text></g><!--link *start* to pending--><g class="link" data-entity-1="ent0007" data-entity-2="ent0001" id="lnk10" data-source-line="11" data-link-type="dependency"><path d="M739.84,20.32 C726.88,25.6 703.62,37.28 693.95,56 C690.48,62.71 691.31,65.92 693.95,73 C697.92,83.65 701.384,89.855 708.724,98.685" style="stroke:#181818;stroke-width:1;" fill="none" id="*start*-to-pending-1"/><polygon points="711.92,102.53,709.243,93.052,708.724,98.685,703.091,98.166,711.92,102.53" fill="#181818" style="stroke:#181818;stroke-width:1;stroke-linejoin:miter;stroke-miterlimit:10;"/><text x="694.95" y="69.067" fill="#000" font-size="13" textLength="63.458">watch_for</text></g><!--link *start* to pending--><g class="link" data-entity-1="ent0007" data-entity-2="ent0001" id="lnk11" data-source-line="12" data-link-type="dependency"><path d="M752.94,25.44 C756.37,33.19 761.05,45.08 762.95,56 C765.62,71.36 764.556,83.513 761.166,97.913" style="stroke:#181818;stroke-width:1;" fill="none" id="*start*-to-pending-2"/><polygon points="760.02,102.78,765.976,94.936,761.166,97.913,758.189,93.103,760.02,102.78" fill="#181818" style="stroke:#181818;stroke-width:1;stroke-linejoin:miter;stroke-miterlimit:10;"/><text x="765.14" y="69.067" fill="#000" font-size="13" textLength="285.962">detach_transaction (expected, not counted)</text></g><!--link pending to confirmed--><g class="link" data-entity-1="ent0001" data-entity-2="ent0002" id="lnk12" data-source-line="13" data-link-type="dependency"><path d="M794,172.37 C806.38,181.82 819.75,192.17 831.95,201.89 C850.95,217.02 867.863,230.945 885.293,245.505" style="stroke:#181818;stroke-width:1;" fill="none" id="pending-to-confirmed"/><polygon points="889.13,248.71,884.787,239.87,885.293,245.505,879.658,246.01,889.13,248.71" fill="#181818" style="stroke:#181818;stroke-width:1;stroke-linejoin:miter;stroke-miterlimit:10;"/><text x="851.73" y="214.957" fill="#000" font-size="13" textLength="93.71">apply(receive)</text></g><!--link confirmed to pending--><g class="link" data-entity-1="ent0002" data-entity-2="ent0001" id="lnk14" data-source-line="15" data-link-type="dependency"><path d="M808.91,248.43 C794.74,240.52 781.57,230.81 770.95,218.89 C759.58,206.14 754.859,192.979 752.169,177.179" style="stroke:#181818;stroke-width:1;" fill="none" id="confirmed-to-pending"/><polygon points="751.33,172.25,748.897,181.794,752.169,177.179,756.784,180.451,751.33,172.25" fill="#181818" style="stroke:#181818;stroke-width:1;stroke-linejoin:miter;stroke-miterlimit:10;"/><text x="771.95" y="214.957" fill="#000" font-size="13" textLength="51.416">rollback</text></g><!--link confirmed to final--><g class="link" data-entity-1="ent0002" data-entity-2="ent0003" id="lnk13" data-source-line="14" data-link-type="dependency"><path d="M928.95,318.07 C928.95,341.16 928.95,366.65 928.95,389.7" style="stroke:#181818;stroke-width:1;" fill="none" id="confirmed-to-final"/><polygon points="928.95,394.7,932.95,385.7,928.95,389.7,924.95,385.7,928.95,394.7" fill="#181818" style="stroke:#181818;stroke-width:1;stroke-linejoin:miter;stroke-miterlimit:10;"/><text x="929.95" y="360.847" fill="#000" font-size="13" textLength="46.439">finalize</text></g><!--link confirmed to *end*--><g class="link" data-entity-1="ent0002" data-entity-2="ent0015" id="lnk16" data-source-line="16" data-link-type="dependency"><path d="M874.73,318.25 C818.69,353.32 739.849,402.638 712.379,419.828" style="stroke:#181818;stroke-width:1;" fill="none" id="confirmed-to-*end*"/><polygon points="708.14,422.48,717.891,421.097,712.379,419.828,713.647,414.315,708.14,422.48" fill="#181818" style="stroke:#181818;stroke-width:1;stroke-linejoin:miter;stroke-miterlimit:10;"/><text x="821.84" y="360.847" fill="#000" font-size="13" textLength="47.347">discard</text></g><!--link final to booked--><g class="link" data-entity-1="ent0003" data-entity-2="ent0005" id="lnk17" data-source-line="17" data-link-type="dependency"><path d="M963.72,464.08 C970.76,472.98 977.16,483.08 980.95,493.67 C988.41,514.54 1050.88,642.97 946.95,771.75 C899.5,830.55 823.251,857.132 755.881,870.002" style="stroke:#181818;stroke-width:1;" fill="none" id="final-to-booked"/><polygon points="750.97,870.94,760.561,873.18,755.881,870.002,759.06,865.322,750.97,870.94" fill="#181818" style="stroke:#181818;stroke-width:1;stroke-linejoin:miter;stroke-miterlimit:10;"/><text x="1003.07" y="668.927" fill="#000" font-size="13" textLength="129.327">spend|apply(spend)</text></g><!--link booked to final--><g class="link" data-entity-1="ent0005" data-entity-2="ent0003" id="lnk24" data-source-line="25" data-link-type="dependency"><path d="M751.04,874.69 C875.78,859.37 1067.68,812.97 1140.95,672.86 C1185.47,587.72 1079.192,510.054 1001.542,466.544" style="stroke:#181818;stroke-width:1;" fill="none" id="booked-to-final"/><polygon points="997.18,464.1,1003.076,471.989,1001.542,466.544,1006.987,465.01,997.18,464.1" fill="#181818" style="stroke:#181818;stroke-width:1;stroke-linejoin:miter;stroke-miterlimit:10;"/><text x="1148.11" y="668.927" fill="#000" font-size="13" textLength="47.347">discard</text></g><!--link final to pinned--><g class="link" data-entity-1="ent0003" data-entity-2="ent0004" id="lnk18" data-source-line="18" data-link-type="dependency"><path d="M813.12,464.15 C796.53,472.15 780.52,481.89 766.95,493.67 C752.55,506.18 743.62,519.42 735.54,535.73" style="stroke:#181818;stroke-width:1;" fill="none" id="final-to-pinned"/><polygon points="733.32,540.21,740.9,533.921,735.54,535.73,733.731,530.37,733.32,540.21" fill="#181818" style="stroke:#181818;stroke-width:1;stroke-linejoin:miter;stroke-miterlimit:10;"/><text x="767.95" y="506.737" fill="#000" font-size="13" textLength="28.057">hold</text></g><!--link pinned to final--><g class="link" data-entity-1="ent0004" data-entity-2="ent0003" id="lnk20" data-source-line="20" data-link-type="dependency"><path d="M775.47,540.29 C808.9,516.32 846.206,489.563 877.576,467.073" style="stroke:#181818;stroke-width:1;" fill="none" id="pinned-to-final"/><polygon points="881.64,464.16,871.995,466.153,877.576,467.073,876.656,472.655,881.64,464.16" fill="#181818" style="stroke:#181818;stroke-width:1;stroke-linejoin:miter;stroke-miterlimit:10;"/><text x="836.64" y="506.737" fill="#000" font-size="13" textLength="135.484">release_hold | expiry</text></g><!--link pinned to booked--><g class="link" data-entity-1="ent0004" data-entity-2="ent0005" id="lnk19" data-source-line="19" data-link-type="dependency"><path d="M767.17,626.18 C774.83,635.12 781.62,645.13 785.95,655.86 C797.24,683.86 823.23,682.92 773.95,771.75 C756.31,803.54 729.617,826.847 701.657,845.677" style="stroke:#181818;stroke-width:1;" fill="none" id="pinned-to-booked"/><polygon points="697.51,848.47,707.209,846.76,701.657,845.677,702.741,840.125,697.51,848.47" fill="#181818" style="stroke:#181818;stroke-width:1;stroke-linejoin:miter;stroke-miterlimit:10;"/><text x="803.43" y="741.867" fill="#000" font-size="13" textLength="135.802">spend(authorization)</text></g><!--link booked to pinned--><g class="link" data-entity-1="ent0005" data-entity-2="ent0004" id="lnk25" data-source-line="26" data-link-type="dependency"><path d="M523.06,878.96 C363.21,871.68 85.07,848.09 24.95,771.75 C6,747.7 6,726.91 24.95,702.86 C90.23,619.97 378.704,595.155 561.864,587.645" style="stroke:#181818;stroke-width:1;" fill="none" id="booked-to-pinned"/><polygon points="566.86,587.44,557.704,583.812,561.864,587.645,558.031,591.805,566.86,587.44" fill="#181818" style="stroke:#181818;stroke-width:1;stroke-linejoin:miter;stroke-miterlimit:10;"/><text x="25.95" y="741.867" fill="#000" font-size="13" textLength="176.42">discard (booked from hold)</text></g><!--link booked to pinned--><g class="link" data-entity-1="ent0005" data-entity-2="ent0004" id="lnk26" data-source-line="27" data-link-type="dependency"><path d="M522.85,869.2 C387.04,849.04 187.61,801.76 263.95,702.86 C301.14,654.67 444.892,623.065 561.902,604.475" style="stroke:#181818;stroke-width:1;" fill="none" id="booked-to-pinned-1"/><polygon points="566.84,603.69,557.324,601.152,561.902,604.475,558.579,609.053,566.84,603.69" fill="#181818" style="stroke:#181818;stroke-width:1;stroke-linejoin:miter;stroke-miterlimit:10;"/><text x="264.95" y="741.867" fill="#000" font-size="13" textLength="124.636">detach_transaction</text></g><!--link pinned to spent--><g class="link" data-entity-1="ent0004" data-entity-2="ent0006" id="lnk21" data-source-line="21" data-link-type="dependency"><path d="M705.44,626.27 C699.36,642.38 690.49,659.97 677.95,672.86 C666.55,684.57 656.928,691.946 642.338,700.076" style="stroke:#181818;stroke-width:1;" fill="none" id="pinned-to-spent"/><polygon points="637.97,702.51,647.779,701.623,642.338,700.076,643.885,694.635,637.97,702.51" fill="#181818" style="stroke:#181818;stroke-width:1;stroke-linejoin:miter;stroke-miterlimit:10;"/><text x="691.78" y="668.927" fill="#000" font-size="13" textLength="85.433">apply(spend)</text></g><!--link spent to pinned--><g class="link" data-entity-1="ent0006" data-entity-2="ent0004" id="lnk29" data-source-line="30" data-link-type="dependency"><path d="M500.31,702.68 C486.7,688.13 477.84,671 488.95,655.86 C507.98,629.94 531.67,614.827 562.03,604.017" style="stroke:#181818;stroke-width:1;" fill="none" id="spent-to-pinned"/><polygon points="566.74,602.34,556.92,601.591,562.03,604.017,559.603,609.127,566.74,602.34" fill="#181818" style="stroke:#181818;stroke-width:1;stroke-linejoin:miter;stroke-miterlimit:10;"/><text x="489.95" y="668.927" fill="#000" font-size="13" textLength="179.182">rollback (settled candidate)</text></g><!--link booked to spent--><g class="link" data-entity-1="ent0005" data-entity-2="ent0006" id="lnk22" data-source-line="23" data-link-type="dependency"><path d="M622.83,848.29 C616.1,833.52 607.45,816.31 597.95,801.75 C591.31,791.57 586.444,785.063 578.564,775.773" style="stroke:#181818;stroke-width:1;" fill="none" id="booked-to-spent"/><polygon points="575.33,771.96,578.101,781.411,578.564,775.773,584.202,776.236,575.33,771.96" fill="#181818" style="stroke:#181818;stroke-width:1;stroke-linejoin:miter;stroke-miterlimit:10;"/><text x="608.98" y="814.817" fill="#000" font-size="13" textLength="35.775">apply</text></g><!--link spent to booked--><g class="link" data-entity-1="ent0006" data-entity-2="ent0005" id="lnk28" data-source-line="29" data-link-type="dependency"><path d="M532.77,772.17 C529.79,787.26 529.25,804.75 536.95,818.75 C543.39,830.46 549.02,837.283 559.79,845.473" style="stroke:#181818;stroke-width:1;" fill="none" id="spent-to-booked"/><polygon points="563.77,848.5,559.027,839.868,559.79,845.473,554.185,846.236,563.77,848.5" fill="#181818" style="stroke:#181818;stroke-width:1;stroke-linejoin:miter;stroke-miterlimit:10;"/><text x="537.95" y="814.817" fill="#000" font-size="13" textLength="51.416">rollback</text></g><!--link booked to booked--><g class="link" data-entity-1="ent0005" data-entity-2="ent0005" id="lnk23" data-source-line="24" data-link-type="dependency"><path d="M751.06,870.32 C771.44,871.99 785.67,876.28 785.67,883.19 C785.67,890.1 776.423,893.992 756.043,895.662" style="stroke:#181818;stroke-width:1;" fill="none" id="booked-to-booked"/><polygon points="751.06,896.07,760.357,899.322,756.043,895.662,759.703,891.348,751.06,896.07" fill="#181818" style="stroke:#181818;stroke-width:1;stroke-linejoin:miter;stroke-miterlimit:10;"/><text x="791.67" y="887.757" fill="#000" font-size="13" textLength="51.416">rollback</text></g><!--link pending to *end*--><g class="link" data-entity-1="ent0001" data-entity-2="ent0015" id="lnk27" data-source-line="28" data-link-type="dependency"><path d="M720.38,172.26 C704.82,192.94 687.11,220.77 678.95,248.89 C660.7,311.77 683.891,386.804 693.641,413.964" style="stroke:#181818;stroke-width:1;" fill="none" id="pending-to-*end*"/><polygon points="695.33,418.67,696.054,408.848,693.641,413.964,688.524,411.551,695.33,418.67" fill="#181818" style="stroke:#181818;stroke-width:1;stroke-linejoin:miter;stroke-miterlimit:10;"/><text x="679.95" y="287.907" fill="#000" font-size="13" textLength="47.347">discard</text></g><!--link spent to spent--><g class="link" data-entity-1="ent0006" data-entity-2="ent0006" id="lnk30" data-source-line="31" data-link-type="dependency"><path d="M680.91,724.86 C701.54,726.78 715.52,730.93 715.52,737.3 C715.52,743.68 706.519,747.369 685.889,749.279" style="stroke:#181818;stroke-width:1;" fill="none" id="spent-to-spent"/><polygon points="680.91,749.74,690.24,752.893,685.889,749.279,689.503,744.927,680.91,749.74" fill="#181818" style="stroke:#181818;stroke-width:1;stroke-linejoin:miter;stroke-miterlimit:10;"/><text x="721.52" y="741.867" fill="#000" font-size="13" textLength="46.439">finalize</text></g><?plantuml-src XLDDRzmW4BtxLupsKhjg_e0FEIHIZzLAERPLD8RP68M01IJRZVBZCs3mrxhARU0ztfilVC10C92HoZm1UZWSn_ZGmhrL1kZVG2AGX62X8t0aIBsH_6EEw0BOq_IsGur6KEMJeh3cfDmBlukQz-LKL8iCS8mG71gF8YZB9ob7iz2pIe_AV6LrKWPrilaPetsBH5BlKNescvNn3PN6JjD6Ur36v1gEAMJrvC859WzFBdfq5_RehUQ-_B81Xl_9pewnF7isiHmlx43VFFIavSQ_i_Ov-z-bi5INWPDrw_wj_TTYdliNajP3Z0wGjKAF0SvyFnAs8zcNh7v__mitDxUBIRU0mw0lTUvyCr7AtDha87VkpnX4_yZLx62I0ZAuN9AwREKFC9oRiA-63qrL7dsHrmn5uhW_xRGY6tXEn5cjEnJF6qBCcBDKNg2JrQWMx_E8Sj4VOmufRXQil65jsfugdwwVr_WQUklKEyO6D4jYoT-H9lJq68NW8tvSvIvBuZZUqesSIPLzhWXBOCfbQi42BFwb0mjeAYvZK9UzTVObLTpiqwz6lXhjkkDZrljfpjYaNJ2eFOMW-KuWIql-8Ss2NtenRSKd?></g></svg>
+\ No newline at end of file
+diff --git a/docs/spec/tx-lifecycle.puml b/docs/spec/tx-lifecycle.puml
+index e2d95b6..fe4c624 100644
+--- a/docs/spec/tx-lifecycle.puml
++++ b/docs/spec/tx-lifecycle.puml
+@@ -10,6 +10,7 @@ state confirmed as "Confirmed" {
+   state failure as "Failure"
+ }
+ state pending as "Pending"
++state detached as "Detached": Candidate handed off to a scope\nNever submitted by the wallet
+ 
+ state final as "Final" {
+   state successF as "Success"
+@@ -18,12 +19,17 @@ state final as "Final" {
+ }
+ 
+ state rejected as "Rejected"
++state ended as "Invalidated | Stale | Released"
+ 
+ [*] --> pending : spend | watch_for
+ [*] --> confirmed : apply
+ pending --> confirmed : apply
++pending --> detached : detach_transaction
++detached --> confirmed : apply
++detached --> ended : sibling settles | validity bound passes | release_hold
+ confirmed --> final : finalize
+ confirmed --> pending : rollback
++confirmed --> detached : rollback (settled candidate)
+ pending ---> rejected : discard
+ confirmed --> rejected : discard
+ 
+diff --git a/docs/spec/tx-lifecycle.svg b/docs/spec/tx-lifecycle.svg
+index 8dd51d3..051b8a6 100644
+--- a/docs/spec/tx-lifecycle.svg
++++ b/docs/spec/tx-lifecycle.svg
+@@ -1 +1 @@
+-<?xml version="1.0" encoding="us-ascii" standalone="no"?><svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" contentStyleType="text/css" height="747px" preserveAspectRatio="none" style="width:670px;height:747px;background:#FFFFFF;" version="1.1" viewBox="0 0 670 747" width="670px" zoomAndPan="magnify"><defs/><g><path d="M164.97,143 L464.97,143 A12.5,12.5 0 0 1 477.47,155.5 L477.47,169.2969 L152.47,169.2969 L152.47,155.5 A12.5,12.5 0 0 1 164.97,143 " fill="#F1F1F1" style="stroke:#F1F1F1;stroke-width:1.0;"/><rect fill="none" height="98.2969" rx="12.5" ry="12.5" style="stroke:#181818;stroke-width:0.5;" width="325" x="152.47" y="143"/><line style="stroke:#181818;stroke-width:0.5;" x1="152.47" x2="477.47" y1="169.2969" y2="169.2969"/><text fill="#000000" font-family="sans-serif" font-size="14" lengthAdjust="spacing" textLength="71" x="279.47" y="160.9951">Confirmed</text><g id="confirmed.success"><rect fill="#F1F1F1" height="50" rx="12.5" ry="12.5" style="stroke:#181818;stroke-width:0.5;" width="79" x="164.47" y="181.2969"/><line style="stroke:#181818;stroke-width:0.5;" x1="164.47" x2="243.47" y1="207.5938" y2="207.5938"/><text fill="#000000" font-family="sans-serif" font-size="14" lengthAdjust="spacing" textLength="59" x="174.47" y="199.292">Success</text></g><g id="confirmed.partialSuccess"><rect fill="#F1F1F1" height="50" rx="12.5" ry="12.5" style="stroke:#181818;stroke-width:0.5;" width="124" x="260.97" y="181.2969"/><line style="stroke:#181818;stroke-width:0.5;" x1="260.97" x2="384.97" y1="207.5938" y2="207.5938"/><text fill="#000000" font-family="sans-serif" font-size="14" lengthAdjust="spacing" textLength="104" x="270.97" y="199.292">Partial Success</text></g><g id="confirmed.failure"><rect fill="#F1F1F1" height="50" rx="12.5" ry="12.5" style="stroke:#181818;stroke-width:0.5;" width="65" x="403.47" y="181.2969"/><line style="stroke:#181818;stroke-width:0.5;" x1="403.47" x2="468.47" y1="207.5938" y2="207.5938"/><text fill="#000000" font-family="sans-serif" font-size="14" lengthAdjust="spacing" textLength="45" x="413.47" y="199.292">Failure</text></g><g id="pending"><rect fill="#F1F1F1" height="50" rx="12.5" ry="12.5" style="stroke:#181818;stroke-width:0.5;" width="77" x="541.47" y="382.44"/><line style="stroke:#181818;stroke-width:0.5;" x1="541.47" x2="618.47" y1="408.7369" y2="408.7369"/><text fill="#000000" font-family="sans-serif" font-size="14" lengthAdjust="spacing" textLength="57" x="551.47" y="400.4351">Pending</text></g><path d="M128.97,358.29 L428.97,358.29 A12.5,12.5 0 0 1 441.47,370.79 L441.47,384.5869 L116.47,384.5869 L116.47,370.79 A12.5,12.5 0 0 1 128.97,358.29 " fill="#F1F1F1" style="stroke:#F1F1F1;stroke-width:1.0;"/><rect fill="none" height="98.2969" rx="12.5" ry="12.5" style="stroke:#181818;stroke-width:0.5;" width="325" x="116.47" y="358.29"/><line style="stroke:#181818;stroke-width:0.5;" x1="116.47" x2="441.47" y1="384.5869" y2="384.5869"/><text fill="#000000" font-family="sans-serif" font-size="14" lengthAdjust="spacing" textLength="31" x="263.47" y="376.2851">Final</text><g id="final.successF"><rect fill="#F1F1F1" height="50" rx="12.5" ry="12.5" style="stroke:#181818;stroke-width:0.5;" width="79" x="128.47" y="396.5869"/><line style="stroke:#181818;stroke-width:0.5;" x1="128.47" x2="207.47" y1="422.8838" y2="422.8838"/><text fill="#000000" font-family="sans-serif" font-size="14" lengthAdjust="spacing" textLength="59" x="138.47" y="414.582">Success</text></g><g id="final.partialSuccessF"><rect fill="#F1F1F1" height="50" rx="12.5" ry="12.5" style="stroke:#181818;stroke-width:0.5;" width="124" x="224.97" y="396.5869"/><line style="stroke:#181818;stroke-width:0.5;" x1="224.97" x2="348.97" y1="422.8838" y2="422.8838"/><text fill="#000000" font-family="sans-serif" font-size="14" lengthAdjust="spacing" textLength="104" x="234.97" y="414.582">Partial Success</text></g><g id="final.failureF"><rect fill="#F1F1F1" height="50" rx="12.5" ry="12.5" style="stroke:#181818;stroke-width:0.5;" width="65" x="367.47" y="396.5869"/><line style="stroke:#181818;stroke-width:0.5;" x1="367.47" x2="432.47" y1="422.8838" y2="422.8838"/><text fill="#000000" font-family="sans-serif" font-size="14" lengthAdjust="spacing" textLength="45" x="377.47" y="414.582">Failure</text></g><g id="rejected"><rect fill="#F1F1F1" height="50" rx="12.5" ry="12.5" style="stroke:#181818;stroke-width:0.5;" width="82" x="48.97" y="691.59"/><line style="stroke:#181818;stroke-width:0.5;" x1="48.97" x2="130.97" y1="717.8869" y2="717.8869"/><text fill="#000000" font-family="sans-serif" font-size="14" lengthAdjust="spacing" textLength="62" x="58.97" y="709.5851">Rejected</text></g><ellipse cx="496.97" cy="16" fill="#222222" rx="10" ry="10" style="stroke:#222222;stroke-width:1.0;"/><!--link *start* to pending--><g id="link_*start*_pending"><path d="M499.32,26.14 C504.62,46.89 517.84,99.1 527.97,143 C543.14,208.7 547.09,225.11 559.97,291.29 C566.06,322.56 571.2259,352.8696 575.0659,376.2096 " fill="none" id="*start*-to-pending" style="stroke:#181818;stroke-width:1.0;"/><polygon fill="#181818" points="576.04,382.13,578.5259,372.6,575.2283,377.1963,570.632,373.8988,576.04,382.13" style="stroke:#181818;stroke-width:1.0;"/><text fill="#000000" font-family="sans-serif" font-size="13" lengthAdjust="spacing" textLength="112" x="550.94" y="196.7069">spend | watch_for</text></g><!--link *start* to confirmed--><g id="link_*start*_confirmed"><path d="M490.06,23.61 C469.87,42.93 413.9353,96.4521 369.7353,138.7421 " fill="none" id="*start*-to-confirmed" style="stroke:#181818;stroke-width:1.0;"/><polygon fill="#181818" points="365.4,142.89,374.6682,139.5583,369.0127,139.4334,369.1376,133.7779,365.4,142.89" style="stroke:#181818;stroke-width:1.0;"/><text fill="#000000" font-family="sans-serif" font-size="13" lengthAdjust="spacing" textLength="34" x="433.91" y="89.0669">apply</text></g><!--link pending to confirmed--><g id="link_pending_confirmed"><path d="M541.09,384.96 C494.48,359.05 421.19,317.79 409.97,308.29 C387.12,288.96 369.1922,268.3981 352.4022,246.4181 " fill="none" id="pending-to-confirmed" style="stroke:#181818;stroke-width:1.0;"/><polygon fill="#181818" points="348.76,241.65,351.0446,251.2302,351.7952,245.6234,357.402,246.3739,348.76,241.65" style="stroke:#181818;stroke-width:1.0;"/><text fill="#000000" font-family="sans-serif" font-size="13" lengthAdjust="spacing" textLength="34" x="410.97" y="304.3569">apply</text></g><!--link confirmed to pending--><g id="link_confirmed_pending"><path d="M397.37,241.65 C420.61,256.57 445.43,273.72 466.97,291.29 C501.7,319.61 533.1762,353.0234 554.8862,377.4734 " fill="none" id="confirmed-to-pending" style="stroke:#181818;stroke-width:1.0;"/><polygon fill="#181818" points="558.87,381.96,555.8854,372.5743,555.5502,378.2212,549.9033,377.886,558.87,381.96" style="stroke:#181818;stroke-width:1.0;"/><text fill="#000000" font-family="sans-serif" font-size="13" lengthAdjust="spacing" textLength="49" x="484.64" y="304.3569">rollback</text></g><!--link confirmed to final--><g id="link_confirmed_final"><path d="M280.73,241.65 C271.86,256.84 263.52,274.13 258.97,291.29 C253.25,312.87 254.6907,331.3377 259.8407,352.0277 " fill="none" id="confirmed-to-final" style="stroke:#181818;stroke-width:1.0;"/><polygon fill="#181818" points="261.29,357.85,262.9977,348.1503,260.0823,352.998,255.2346,350.0827,261.29,357.85" style="stroke:#181818;stroke-width:1.0;"/><text fill="#000000" font-family="sans-serif" font-size="13" lengthAdjust="spacing" textLength="44" x="259.97" y="304.3569">finalize</text></g><!--link pending to rejected--><g id="link_pending_rejected"><path d="M541.11,432.8 C449.44,490.26 225.5936,630.573 133.9236,688.043 " fill="none" id="pending-to-rejected" style="stroke:#181818;stroke-width:1.0;"/><polygon fill="#181818" points="128.84,691.23,138.5901,689.8385,133.0763,688.5742,134.3407,683.0604,128.84,691.23" style="stroke:#181818;stroke-width:1.0;"/><text fill="#000000" font-family="sans-serif" font-size="13" lengthAdjust="spacing" textLength="46" x="315.58" y="586.6569">discard</text></g><!--link confirmed to rejected--><g id="link_confirmed_rejected"><path d="M194.96,241.64 C145.68,268.25 93.75,306.53 65.97,358.29 C6,470.04 54.7108,624.9743 77.8408,685.5843 " fill="none" id="confirmed-to-rejected" style="stroke:#181818;stroke-width:1.0;"/><polygon fill="#181818" points="79.98,691.19,80.5083,681.3553,78.1973,686.5186,73.034,684.2076,79.98,691.19" style="stroke:#181818;stroke-width:1.0;"/><text fill="#000000" font-family="sans-serif" font-size="13" lengthAdjust="spacing" textLength="46" x="40.5" y="519.6569">discard</text></g><!--SRC=[ZL2xQiGm4Epr5OkQWy31fNMH9k0wvCeZX8sqJZRMIKBI4Nn9_ZssvHUEYwiqEpCQPdSNQxOU0vx1iANKU0BlJDCDOjQiqnJ9m_tXi603sdfaHKoO29Ip5OSpQS08yd6S97mBW6o95wKenjvmp5XEOXkS6CrnuNdA5FppLiZc4gWtbHbByJiKyMGrs_USaB4SIrPisxp-MuSsofMtj2jlgbUk-mqb0dsIIiEXdeUXhNYwUu7z_c5Qe83OGVY1BqpguxLoOVBCrou0lJUD67zjgpFJwVaCHNxvIYjvBX2SCM-ewaLwgqyB5A0vAWnw5R1X-0C0]--></g></svg>
+\ No newline at end of file
++<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" version="1.1" data-diagram-type="STATE" style="width:1469px;height:829px;background:#FFFFFF;" width="1469px" height="829px" viewBox="0 0 1469 829" zoomAndPan="magnify" preserveAspectRatio="none" contentStyleType="text/css"><?plantuml 1.2026.8?><defs/><g font-family="sans-serif" lengthAdjust="spacing"><g class="entity" data-qualified-name="confirmed" id="ent0001" data-source-line="6"><path d="M939.5,143 L1256.503,143 A12.5,12.5 0 0 1 1269.003,155.5 L1269.003,169.297 L927,169.297 L927,155.5 A12.5,12.5 0 0 1 939.5,143" fill="#F1F1F1"/><rect x="927" y="143" width="342.003" height="101.297" fill="none" style="stroke:#181818;stroke-width:0.5;" rx="12.5" ry="12.5"/><line x1="927" y1="169.297" x2="1269.003" y2="169.297" style="stroke:#181818;stroke-width:0.5;"/><text x="1061.539" y="160.995" fill="#000" font-size="14" textLength="72.926">Confirmed</text><g class="entity" data-qualified-name="confirmed.success" id="ent0002" data-source-line="7"><rect x="939" y="181.297" width="76.355" height="50" fill="#F1F1F1" style="stroke:#181818;stroke-width:0.5;" rx="12.5" ry="12.5"/><line x1="939" y1="207.594" x2="1015.355" y2="207.594" style="stroke:#181818;stroke-width:0.5;"/><text x="949" y="199.292" fill="#000" font-size="14" textLength="56.355">Success</text></g><g class="entity" data-qualified-name="confirmed.partialSuccess" id="ent0003" data-source-line="8"><rect x="1033.46" y="181.297" width="125.431" height="50" fill="#F1F1F1" style="stroke:#181818;stroke-width:0.5;" rx="12.5" ry="12.5"/><line x1="1033.46" y1="207.594" x2="1158.891" y2="207.594" style="stroke:#181818;stroke-width:0.5;"/><text x="1043.46" y="199.292" fill="#000" font-size="14" textLength="105.431">Partial Success</text></g><g class="entity" data-qualified-name="confirmed.failure" id="ent0004" data-source-line="9"><rect x="1177.35" y="181.297" width="67.653" height="50" fill="#F1F1F1" style="stroke:#181818;stroke-width:0.5;" rx="12.5" ry="12.5"/><line x1="1177.35" y1="207.594" x2="1245.003" y2="207.594" style="stroke:#181818;stroke-width:0.5;"/><text x="1187.35" y="199.292" fill="#000" font-size="14" textLength="47.653">Failure</text></g></g><g class="entity" data-qualified-name="pending" id="ent0005" data-source-line="11"><rect x="1217.77" y="386.94" width="76.465" height="50" fill="#F1F1F1" style="stroke:#181818;stroke-width:0.5;" rx="12.5" ry="12.5"/><line x1="1217.77" y1="413.237" x2="1294.235" y2="413.237" style="stroke:#181818;stroke-width:0.5;"/><text x="1227.77" y="404.935" fill="#000" font-size="14" textLength="56.465">Pending</text></g><g class="entity" data-qualified-name="detached" id="ent0006" data-source-line="12"><rect x="770.68" y="579.59" width="248.648" height="68.891" fill="#F1F1F1" style="stroke:#181818;stroke-width:0.5;" rx="12.5" ry="12.5"/><line x1="770.68" y1="605.887" x2="1019.328" y2="605.887" style="stroke:#181818;stroke-width:0.5;"/><text x="861.238" y="597.585" fill="#000" font-size="14" textLength="67.532">Detached</text><text x="775.68" y="623.882" fill="#000" font-size="14" textLength="228.648">Candidate handed off to a scope</text><text x="775.68" y="640.179" fill="#000" font-size="14" textLength="212.659">Never submitted by the wallet</text></g><g class="entity" data-qualified-name="final" id="ent0007" data-source-line="14"><path d="M19.5,361.29 L336.503,361.29 A12.5,12.5 0 0 1 349.003,373.79 L349.003,387.587 L7,387.587 L7,373.79 A12.5,12.5 0 0 1 19.5,361.29" fill="#F1F1F1"/><rect x="7" y="361.29" width="342.003" height="101.297" fill="none" style="stroke:#181818;stroke-width:0.5;" rx="12.5" ry="12.5"/><line x1="7" y1="387.587" x2="349.003" y2="387.587" style="stroke:#181818;stroke-width:0.5;"/><text x="161.36" y="379.285" fill="#000" font-size="14" textLength="33.284">Final</text><g class="entity" data-qualified-name="final.successF" id="ent0008" data-source-line="15"><rect x="19" y="399.587" width="76.355" height="50" fill="#F1F1F1" style="stroke:#181818;stroke-width:0.5;" rx="12.5" ry="12.5"/><line x1="19" y1="425.884" x2="95.355" y2="425.884" style="stroke:#181818;stroke-width:0.5;"/><text x="29" y="417.582" fill="#000" font-size="14" textLength="56.355">Success</text></g><g class="entity" data-qualified-name="final.partialSuccessF" id="ent0009" data-source-line="16"><rect x="113.46" y="399.587" width="125.431" height="50" fill="#F1F1F1" style="stroke:#181818;stroke-width:0.5;" rx="12.5" ry="12.5"/><line x1="113.46" y1="425.884" x2="238.891" y2="425.884" style="stroke:#181818;stroke-width:0.5;"/><text x="123.46" y="417.582" fill="#000" font-size="14" textLength="105.431">Partial Success</text></g><g class="entity" data-qualified-name="final.failureF" id="ent0010" data-source-line="17"><rect x="257.35" y="399.587" width="67.653" height="50" fill="#F1F1F1" style="stroke:#181818;stroke-width:0.5;" rx="12.5" ry="12.5"/><line x1="257.35" y1="425.884" x2="325.003" y2="425.884" style="stroke:#181818;stroke-width:0.5;"/><text x="267.35" y="417.582" fill="#000" font-size="14" textLength="47.653">Failure</text></g></g><g class="entity" data-qualified-name="rejected" id="ent0011" data-source-line="20"><rect x="1321.24" y="765.48" width="81.53" height="50" fill="#F1F1F1" style="stroke:#181818;stroke-width:0.5;" rx="12.5" ry="12.5"/><line x1="1321.24" y1="791.777" x2="1402.77" y2="791.777" style="stroke:#181818;stroke-width:0.5;"/><text x="1331.24" y="783.475" fill="#000" font-size="14" textLength="61.53">Rejected</text></g><g class="entity" data-qualified-name="ended" id="ent0012" data-source-line="21"><rect x="753.5" y="765.48" width="225.01" height="50" fill="#F1F1F1" style="stroke:#181818;stroke-width:0.5;" rx="12.5" ry="12.5"/><line x1="753.5" y1="791.777" x2="978.51" y2="791.777" style="stroke:#181818;stroke-width:0.5;"/><text x="763.5" y="783.475" fill="#000" font-size="14" textLength="205.01">Invalidated | Stale | Released</text></g><g class="start_entity" data-qualified-name=".start." id="ent0013" data-source-line="23"><ellipse cx="1336" cy="16" rx="10" ry="10" fill="#222" style="stroke:#222;stroke-width:1;"/></g><!--link *start* to pending--><g class="link" data-entity-1="ent0013" data-entity-2="ent0005" id="lnk14" data-source-line="23" data-link-type="dependency"><path d="M1336.25,26.23 C1336.89,57.37 1337.41,161.23 1319,244.29 C1307.39,296.69 1284.683,350.074 1269.903,381.964" style="stroke:#181818;stroke-width:1;" fill="none" id="*start*-to-pending"/><polygon points="1267.8,386.5,1275.214,380.016,1269.903,381.964,1267.955,376.652,1267.8,386.5" fill="#181818" style="stroke:#181818;stroke-width:1;stroke-linejoin:miter;stroke-miterlimit:10;"/><text x="1333.89" y="198.207" fill="#000" font-size="13" textLength="115.616">spend | watch_for</text></g><!--link *start* to confirmed--><g class="link" data-entity-1="ent0013" data-entity-2="ent0001" id="lnk15" data-source-line="24" data-link-type="dependency"><path d="M1328.08,22.84 C1303.12,41.26 1228.283,96.491 1169.813,139.651" style="stroke:#181818;stroke-width:1;" fill="none" id="*start*-to-confirmed"/><polygon points="1165.79,142.62,1175.406,140.493,1169.813,139.651,1170.655,134.057,1165.79,142.62" fill="#181818" style="stroke:#181818;stroke-width:1;stroke-linejoin:miter;stroke-miterlimit:10;"/><text x="1253.23" y="89.067" fill="#000" font-size="13" textLength="35.775">apply</text></g><!--link pending to confirmed--><g class="link" data-entity-1="ent0005" data-entity-2="ent0001" id="lnk16" data-source-line="25" data-link-type="dependency"><path d="M1238.27,386.67 C1213.24,352.41 1169.929,293.118 1137.399,248.578" style="stroke:#181818;stroke-width:1;" fill="none" id="pending-to-confirmed"/><polygon points="1134.45,244.54,1136.528,254.167,1137.399,248.578,1142.988,249.449,1134.45,244.54" fill="#181818" style="stroke:#181818;stroke-width:1;stroke-linejoin:miter;stroke-miterlimit:10;"/><text x="1182.74" y="307.357" fill="#000" font-size="13" textLength="35.775">apply</text></g><!--link confirmed to pending--><g class="link" data-entity-1="ent0001" data-entity-2="ent0005" id="lnk21" data-source-line="30" data-link-type="dependency"><path d="M1085.16,244.75 C1082.31,266.46 1082.88,291.39 1094,311.29 C1120.18,358.13 1173.688,383.987 1212.718,397.847" style="stroke:#181818;stroke-width:1;" fill="none" id="confirmed-to-pending"/><polygon points="1217.43,399.52,1210.287,392.739,1212.718,397.847,1207.61,400.278,1217.43,399.52" fill="#181818" style="stroke:#181818;stroke-width:1;stroke-linejoin:miter;stroke-miterlimit:10;"/><text x="1095" y="307.357" fill="#000" font-size="13" textLength="51.416">rollback</text></g><!--link pending to detached--><g class="link" data-entity-1="ent0005" data-entity-2="ent0006" id="lnk17" data-source-line="26" data-link-type="dependency"><path d="M1217.61,431.38 C1177.76,450.77 1113.85,482.57 1060,512.59 C1022.07,533.74 984.531,556.542 952.501,576.542" style="stroke:#181818;stroke-width:1;" fill="none" id="pending-to-detached"/><polygon points="948.26,579.19,958.013,577.816,952.501,576.542,953.775,571.03,948.26,579.19" fill="#181818" style="stroke:#181818;stroke-width:1;stroke-linejoin:miter;stroke-miterlimit:10;"/><text x="1061" y="525.657" fill="#000" font-size="13" textLength="124.636">detach_transaction</text></g><!--link detached to confirmed--><g class="link" data-entity-1="ent0006" data-entity-2="ent0001" id="lnk18" data-source-line="27" data-link-type="dependency"><path d="M911.41,579.22 C947.07,505.71 1029.647,335.518 1071.537,249.198" style="stroke:#181818;stroke-width:1;" fill="none" id="detached-to-confirmed"/><polygon points="1073.72,244.7,1066.192,251.051,1071.537,249.198,1073.389,254.543,1073.72,244.7" fill="#181818" style="stroke:#181818;stroke-width:1;stroke-linejoin:miter;stroke-miterlimit:10;"/><text x="1017.68" y="416.507" fill="#000" font-size="13" textLength="35.775">apply</text></g><!--link confirmed to detached--><g class="link" data-entity-1="ent0001" data-entity-2="ent0006" id="lnk22" data-source-line="31" data-link-type="dependency"><path d="M926.91,238.54 C864.51,263.72 800.4,302.46 764,361.29 C717.48,436.5 796.908,526.638 850.738,575.808" style="stroke:#181818;stroke-width:1;" fill="none" id="confirmed-to-detached"/><polygon points="854.43,579.18,850.483,570.157,850.738,575.808,845.087,576.064,854.43,579.18" fill="#181818" style="stroke:#181818;stroke-width:1;stroke-linejoin:miter;stroke-miterlimit:10;"/><text x="765" y="416.507" fill="#000" font-size="13" textLength="179.182">rollback (settled candidate)</text></g><!--link detached to ended--><g class="link" data-entity-1="ent0006" data-entity-2="ent0012" id="lnk19" data-source-line="28" data-link-type="dependency"><path d="M869.58,648.9 C860.23,663.38 850.76,680.97 846,698.48 C839.93,720.8 845.033,741.934 852.353,760.344" style="stroke:#181818;stroke-width:1;" fill="none" id="detached-to-ended"/><polygon points="854.2,764.99,854.592,755.149,852.353,760.344,847.158,758.105,854.2,764.99" fill="#181818" style="stroke:#181818;stroke-width:1;stroke-linejoin:miter;stroke-miterlimit:10;"/><text x="847" y="711.547" fill="#000" font-size="13" textLength="338.641">sibling settles | validity bound passes | release_hold</text></g><!--link confirmed to final--><g class="link" data-entity-1="ent0001" data-entity-2="ent0007" id="lnk20" data-source-line="29" data-link-type="dependency"><path d="M926.6,206.05 C788.75,218.53 591.32,243.92 425,294.29 C370.76,310.72 317.785,334.94 271.975,358.54" style="stroke:#181818;stroke-width:1;" fill="none" id="confirmed-to-final"/><polygon points="267.53,360.83,277.363,360.264,271.975,358.54,273.699,353.152,267.53,360.83" fill="#181818" style="stroke:#181818;stroke-width:1;stroke-linejoin:miter;stroke-miterlimit:10;"/><text x="426" y="307.357" fill="#000" font-size="13" textLength="46.439">finalize</text></g><!--link pending to rejected--><g class="link" data-entity-1="ent0005" data-entity-2="ent0011" id="lnk23" data-source-line="32" data-link-type="dependency"><path d="M1262.87,437.36 C1282.05,505.48 1334.636,692.257 1353.786,760.307" style="stroke:#181818;stroke-width:1;" fill="none" id="pending-to-rejected"/><polygon points="1355.14,765.12,1356.552,755.373,1353.786,760.307,1348.852,757.54,1355.14,765.12" fill="#181818" style="stroke:#181818;stroke-width:1;stroke-linejoin:miter;stroke-miterlimit:10;"/><text x="1322.27" y="618.597" fill="#000" font-size="13" textLength="47.347">discard</text></g><!--link confirmed to rejected--><g class="link" data-entity-1="ent0001" data-entity-2="ent0011" id="lnk24" data-source-line="33" data-link-type="dependency"><path d="M1206.57,244.7 C1255.48,272.48 1309.8,311.56 1344,361.29 C1430.39,486.91 1399.34,546.22 1407,698.48 C1407.38,706.03 1409.04,708.2 1407,715.48 C1401.97,733.43 1394.152,747.281 1384.432,760.991" style="stroke:#181818;stroke-width:1;" fill="none" id="confirmed-to-rejected"/><polygon points="1381.54,765.07,1390.008,760.041,1384.432,760.991,1383.482,755.415,1381.54,765.07" fill="#181818" style="stroke:#181818;stroke-width:1;stroke-linejoin:miter;stroke-miterlimit:10;"/><text x="1406.65" y="525.657" fill="#000" font-size="13" textLength="47.347">discard</text></g><?plantuml-src ZLBBJiCm4BpdArQvy90gbMiEN8egSK6eFGAgDiw6cBgsPMzRXSU_uyHvKIh1oUETyMfcrnT-AxL5XpjGKXFNbi0QLJUNPEIqASYJXPlvV59rgBTzDV6CJ22CBgNRKG7e8LtqjnG-4e0eyNiXoFjMi8uu7SZGc2MgzKJp64lmIrkYL7j7hMWPSPfyTKOiwKBgrzWXuhIZ2c8KLMVnhhka6Immo8f6KGKKU5EMm0OGl32MdlK37SW5__bECWS-hu4hWYCgHTnFe9Gwc6qzDUXCykL_eY__bNrv6hupuUYD17SHLzsbpqzjk8QvrmTKRUG2Fc7Dg2YSArA4lj4dJzSlC9lT3jFCm3SmY8x8ejgKnWsQSVKPeBMgJlfNVxF3Ih8ERZXyBe-2fT79m9vlz8EEuO9FcQkckoTcHJuuRgDAhY4t-n31elTjtSMucyge8XcxDytYBhDuodSweSUfEADKZc9x8fZ4wXLm6HqL8FhlTZKPHNWqx2xCGdg1xjJL6S4t?></g></svg>
+\ No newline at end of file
+-- 
+2.50.1 (Apple Git-155)
+

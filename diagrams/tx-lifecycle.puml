@@ -1,0 +1,31 @@
+@startuml
+
+'skinparam linetype polyline
+skinparam nodesep 100
+skinparam ranksep 100
+
+state confirmed as "Confirmed" {
+  state success as "Success"
+  state partialSuccess as "Partial Success"
+  state failure as "Failure"
+}
+state pending as "Pending": submitter = wallet (submitted and re-submitted by the wallet)\nor submitter = scope (candidate: handed off, never submitted by the wallet)
+
+state final as "Final" {
+  state successF as "Success"
+  state partialSuccessF as "Partial Success"
+  state failureF as "Failure"
+}
+
+state rejected as "Rejected": reason = discarded | released | invalidated | stale | expired\nkeeps validity bound while it may still settle
+
+[*] --> pending : spend | watch_for | detach_transaction
+[*] --> confirmed : apply
+pending --> confirmed : apply
+confirmed --> final : finalize
+confirmed --> pending : rollback
+pending ---> rejected : discard | release_hold | sibling settles | validity bound passes
+rejected --> confirmed : apply (outstanding transaction settled by another party)
+confirmed --> rejected : discard
+
+@enduml

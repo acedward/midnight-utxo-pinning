@@ -1,0 +1,36 @@
+@startuml
+left to right direction
+skinparam nodesep 40
+skinparam ranksep 50
+
+state pending as "Pending": Coin expected to be received\nPart of pending balance (not counted if expected\nfrom a scope-submitted transaction)
+state confirmed as "Confirmed": Coin received in a transaction added to the chain\nPart of pending balance
+state final as "Final": Coin received in a finalized transaction\nPart of available balance\nMay carry 'outstanding' entries: transactions that\ncould still consume it (warning shown, still available)
+state booked as "Booked (not part of balance)" {
+  state bookedTx as "by transaction": Booked for a pending transaction\n(current behaviour)
+  state bookedHold as "by hold": Pinned: reserved by a hold, idle\nIn the owning scope's held balance
+  state bookedBoth as "by hold and transaction": Pinned and booked by a\ncandidate being built
+  bookedHold -down-> bookedBoth : spend(use)
+  bookedBoth -up-> bookedHold : detach_transaction\n| discard
+}
+note bottom of booked : rollback of a transaction that spent\nbooked coins keeps them booked
+state spent as "Spent" : Coin spent in a transaction\nNot part of balance
+
+[*] --> confirmed : apply(receive)
+[*] --> pending : spend | watch_for
+pending --> confirmed : apply(receive)
+confirmed --> final : finalize
+confirmed --> pending : rollback
+confirmed --> [*] : discard
+pending --> [*] : discard
+final -down-> bookedTx : spend | apply(spend)
+final -down-> bookedHold : hold | spend(mark)
+bookedHold -up-> final : release_hold | expiry\n(+ outstanding entries)
+bookedTx -up-> final : discard\n(+ outstanding entry if shared)
+booked -right-> spent : apply
+final -down-> spent : apply\n(outstanding tx settled)
+spent --> booked : rollback\n(restores record)
+spent --> final : rollback\n(outstanding)
+spent --> spent : finalize
+
+@enduml

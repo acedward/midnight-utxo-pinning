@@ -1,0 +1,32 @@
+From 7cee48ea131bae2dc10aba82cbf99e0d0ecd663b Mon Sep 17 00:00:00 2001
+From: Eddie <edward.alvarado@midnight.foundation>
+Date: Tue, 8 Sep 2026 19:39:19 -0300
+Subject: [PATCH 6/6] docs(spec): candidate validity - unshielded intents
+ expire by TTL; bounds are ledger-enforced
+
+---
+ docs/spec/Specification.md | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/docs/spec/Specification.md b/docs/spec/Specification.md
+index 5e9cff3..a8fd833 100644
+--- a/docs/spec/Specification.md
++++ b/docs/spec/Specification.md
+@@ -721,7 +721,13 @@ wallet's signatures and mergeable as a whole. The wallet keeps, for every candid
+     deployed value is expected to be much longer (days) but is not confirmed until a network running ledger v9 exists
+   - for Dust spends, the same root retention applies to the Dust commitment and generation trees, and the spend is
+     additionally bound to the timestamp it was built with
+-  - for intents, the smallest intent TTL
++  - for unshielded inputs, the TTL of the intent that carries them (chosen at build time, within the margin the ledger
++    allows ahead of the current block); an intent past its TTL can never be applied. A candidate with intents has the
++    smallest intent TTL as one of its bounds
++
++  The candidate's validity bound is the minimum of the bounds that apply to it. Every bound is enforced by the ledger,
++  so a candidate past its bound can never settle: the wallet marks it `Rejected(stale)` (root retention) or
++  `Rejected(expired)` (TTL) and needs no `outstanding` entry for it.
+ - its status, which is the ordinary transaction status with extra metadata: *live* is `Pending` with the scope as
+   submitter; *settled* is `Confirmed`; *invalidated* (one of its inputs was spent by another transaction, e.g. a
+   sibling candidate), *stale* (validity bound passed) and *released* (hold released) are `Rejected` with that reason.
+-- 
+2.50.1 (Apple Git-155)
+
