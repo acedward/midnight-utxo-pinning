@@ -1,7 +1,7 @@
 From bad709e53f15f2e46da462c59f00c44f106e4564 Mon Sep 17 00:00:00 2001
 From: Eddie <edward.alvarado@midnight.foundation>
 Date: Tue, 8 Sep 2026 23:39:49 -0300
-Subject: [PATCH 8/8] docs(spec): drop hold mode; no validity bound or network
+Subject: [PATCH 8/9] docs(spec): drop hold mode; no validity bound or network
  parameters exposed; fee sharing out of scope
 
 ---

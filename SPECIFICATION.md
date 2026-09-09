@@ -20,7 +20,8 @@ definitions above are refined as follows:
   [Coin and transaction lifecycle with holds](#coin-and-transaction-lifecycle-with-holds)) **are** available; the wallet
   warns about them but does not withhold them
 - held - derived from coins booked by holds; it is reported **per scope**: an observer sees only the held balance of
-  the holds its own scope owns, the wallet user sees the held balance of all holds
+  the holds its own scope owns, the wallet user sees the held balance of all holds. The breakdown by identifier is
+  available to the owning scope through `list_holds`
 - pending - as above, except that outputs expected from *candidate* transactions (see below) are not counted, because
   candidates in one hold are usually mutually exclusive and at most one of them will settle
 - total - available + pending + held (for the wallet user); for a scope it is available + pending + held of that scope
@@ -321,6 +322,23 @@ Expiry needs no operation: references are pruned when their validity bound passe
 and whose candidates all went stale releases its coins by itself. Expiry is evaluated against the wallet clock and
 SHOULD include the same latency margin used for TTL handling.
 
+#### `list_holds`
+
+Reports to the requesting scope what the wallet keeps pinned for it, so that an application can show the user what it
+has reserved and decide whether to reuse an identifier. The scope is derived by the wallet, as for every other
+operation; the wallet user's own scope sees every hold. The report contains, for each identifier of the scope:
+
+- the amount pinned under it, per token type (the sum of the coins carrying at least one reference under the
+  identifier; a coin pinned under several identifiers is counted under each)
+- the number of live candidates, and, for each, its identifying components as they appear in the transaction the scope
+  already holds (value commitments, nullifiers) and its validity bound; nothing the scope does not already know
+- the reservation's `expires_at`, if there is one
+- the number of `outstanding` entries the scope's dropped candidates left on coins, with their validity bounds
+
+The report MUST NOT include coin identifiers, nonces, Merkle indices or any other data the scope did not receive with
+its candidates, and MUST NOT include anything about other scopes' holds; a scope with no holds receives an empty
+report, indistinguishable from a wallet that never had any.
+
 ### 3.3 Amendments to existing operations
 
 **`apply_transaction`, steps to apply a shielded offer, step 3 becomes:**
@@ -435,6 +453,7 @@ Each requirement is traceable to the text above and to at least one conformance 
 | R-29 | The wallet user interface SHOULD show, for every hold, the owning scope, amount, expiry and candidate count, and let the user drop it. | 2, privacy 5 |
 | R-30 | A held offer MUST be built through `spend` with an authorization; pure shielded candidates MUST contain no intent; candidates with unshielded inputs or Dust spends MUST carry one intent with a randomly chosen segment id and a TTL. | 4 |
 | R-31 | `force: true` on `detach_transaction` MUST suppress the `outstanding` entry; the wallet MAY record the caller's assertion in history and MAY require the wallet user's confirmation when the request comes from a scope. | 3.2 |
+| R-32 | `list_holds(scope)` MUST report, for the requesting scope only, each identifier with the amount pinned per token type, its live candidates (identified by components the scope already holds) with validity bounds, the reservation expiry and the number of outstanding entries; it MUST NOT reveal coin identifiers, nonces, Merkle indices or anything about other scopes, and an empty report MUST be indistinguishable from a wallet that never had holds. | 3.2 |
 
 ## 6. Conformance scenarios
 
@@ -464,3 +483,4 @@ Each scenario names the requirements it exercises. Coin X is a final 150 NIGHT s
 | C-16 | persisted hold state corrupted | wallet restarts | ordinary spends refused until the user restores or acknowledges a reset | R-14 |
 | C-17 | X final, wallet-submitted transaction T booked X, T was exported to a third party | T is discarded before its bound | X `Final` with an outstanding entry for T; if T later confirms, `Rejected → Confirmed` | R-20, R-18 |
 | C-18 | two concurrent builds with different ids compete for the last unpinned coin | both run | exactly one pins it; the other fails with the ordinary error (it cannot take a coin pinned only under another id) | R-09, R-12 |
+| C-19 | C-02a | M calls `list_holds`; N calls `list_holds` | M sees r7: 150 NIGHT, candidates A, B, C; r8: 150 NIGHT, candidate D, each with its bound, and no coin identifiers; N receives an empty report | R-32, R-26, R-27 |

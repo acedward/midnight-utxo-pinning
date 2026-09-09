@@ -41,18 +41,23 @@ that D was never sent anywhere, `detach_transaction(D, { force: true })` would h
 
 ## The problem
 
-The wallet specification reserves coins through *booking*: `spend` moves a coin from `Final` to `Booked`; when the
-transaction settles the coin becomes `Spent`; when the wallet gives up (`discard_transaction`) the coin returns to
-`Final`. Booking is binary and single-purpose. A bidding application needs three things it cannot provide:
+**(A) A user cannot use the same coins for several transactions.** The wallet books a coin for the first transaction
+that spends it. The only way to use it for a second one is to cancel the first, which un-books the coin and makes the
+wallet forget the transaction, even though whoever received it can still submit it. Bidding 100 tokens on each of
+several items with the same 100 tokens is impossible today.
 
-| Need | Why booking fails |
-|---|---|
-| Bid on products A, B and C with the same 100 NIGHT; whichever bid the seller accepts first takes the funds | One coin can be booked for one transaction |
-| Hand the offer to the marketplace and keep using the wallet | Once the offer leaves, the wallet must keep it pending forever (blocking the coin for everything) or discard it (un-booking the coin) |
-| Stay safe while bids are out | An unrelated transfer, or another dApp's balancing request, can spend the coin and silently invalidate every bid |
+**(B) A dApp cannot suggest whether coins should be reused.** There is no way for an application to say "build this
+with the same coins as before" or "build this with fresh coins"; coin selection is entirely the wallet's, and it never
+selects a booked coin.
 
-And a privacy requirement: the marketplace that collected the bids may know they conflict, but no other application
-should learn that funds are reserved, for what, or how many offers exist.
+**(C) Reuse knowledge must be private per application.** What one application has reserved, for what, and how many
+candidates exist must not be visible to another application. Everything about a reservation has to be scoped to the
+authenticated origin that made it; other origins must see the coins as simply used.
+
+**(D) The wallet specification already defines booking.** Solving (A) to (C) outside the specification, in the wallet
+application or in the dApp, would mean a second coin-management layer duplicating the one the specification defines,
+with all the consistency problems that brings. The solution has to be an extension of the specification's own booking
+model.
 
 ## Current states
 
@@ -140,10 +145,14 @@ A build may carry `use: X` and, optionally, `mark: Y` (defaulting to X):
 
 Without an authorization, coin selection works exactly as today and never touches booked coins.
 
-### 4. Two operations
+### 4. Three operations
 
 - `hold(scope, id, selection, policy)` — reserve coins up front without building anything (a `reservation` reference
   that lapses at `expires_at`), or set the policy before the first build creates the hold implicitly.
+- `list_holds(scope)` — report to the application what is pinned for it: its ids, the amount pinned under each per
+  token type, the live candidates (by the components the application already holds) and their validity bounds, the
+  reservation expiry, and how many outstanding entries its dropped candidates left. Nothing about other origins, and
+  nothing the application did not already receive with its candidates.
 - `detach_transaction(transaction | {id}, {force?})` — drop one candidate, or every candidate and the reservation
   under an id: remove the references from the coins, mark the candidates `Rejected(detached)`, and remember them as
   `outstanding` while they could still settle. `force: true` skips the memory when the caller knows the candidate was
@@ -179,6 +188,8 @@ sequenceDiagram
     W-->>M: offer B
     M->>W: build bid C (use "round-7")
     W-->>M: offer C
+    M->>W: list_holds
+    W-->>M: round-7: 150 NIGHT pinned, 3 live candidates (A, B, C)
 
     U->>W: ordinary transfer 120 NIGHT
     W-->>U: insufficient funds (X is Booked, not eligible)
@@ -288,7 +299,8 @@ service, expiring at its TTL.
 ## Privacy
 
 - `available` excludes every pinned coin for every observer, including the owning scope; pinned coins are `Booked`.
-- `held` is reported per scope: a dApp sees the amount pinned for it and nothing about other scopes' holds.
+- `held` is reported per scope, and `list_holds` breaks it down by id for the owning scope only: a dApp sees what is
+  pinned for it and nothing about other scopes' holds.
 - All balances are computed by one function regardless of who owns the pins. A scope that does not own a hold cannot
   distinguish a pinned coin from a spent one.
 - Hold identifiers resolve only within the requesting scope. A foreign id finds nothing, exactly as a never-used id.

@@ -1,0 +1,67 @@
+From c8aac6445e3e0cf211cc7c5d053b56d372337ccb Mon Sep 17 00:00:00 2001
+From: Eddie <edward.alvarado@midnight.foundation>
+Date: Tue, 8 Sep 2026 23:58:08 -0300
+Subject: [PATCH 9/9] docs(spec): list_holds reports a scope's own pinned coins
+
+---
+ docs/spec/Specification.md | 23 ++++++++++++++++++++++-
+ 1 file changed, 22 insertions(+), 1 deletion(-)
+
+diff --git a/docs/spec/Specification.md b/docs/spec/Specification.md
+index 8297983..22cbda2 100644
+--- a/docs/spec/Specification.md
++++ b/docs/spec/Specification.md
+@@ -86,6 +86,7 @@ This document comprises a couple of sections:
+       - [`watch_for`](#watch_for)
+       - [`hold`](#hold)
+       - [`detach_transaction`](#detach_transaction)
++      - [`list_holds`](#list_holds)
+   - [Synchronization process](#synchronization-process)
+     - [Indexing service for shielded tokens](#indexing-service-for-shielded-tokens)
+     - [Indexing service for unshielded tokens](#indexing-service-for-unshielded-tokens)
+@@ -580,6 +581,8 @@ There are 9 foundational operations defined, which should be atomic to whole wal
+ - `detach_transaction(transaction | {id}, {force?})` - which drops one candidate, or every candidate and reservation
+   under an identifier, releasing the pins they kept alive; `force` skips the `outstanding` memory when the caller knows
+   the candidate was never made public
++- `list_holds(scope)` - which reports to a scope what is pinned for it: its identifiers, the amounts pinned under each,
++  and their live candidates
+ 
+ Functions `apply_transaction`, `finalize_transaction` and `rollback_transaction` can be extended to blocks, ranges of
+ blocks or other data to reconstruct the wallet state. Since shielded tokens are implemented using effectively a UTxO
+@@ -621,7 +624,8 @@ definitions above are refined as follows:
+   [Coin and transaction lifecycle with holds](#coin-and-transaction-lifecycle-with-holds)) **are** available; the wallet
+   warns about them but does not withhold them
+ - held - derived from coins booked by holds; it is reported **per scope**: an observer sees only the held balance of
+-  the holds its own scope owns, the wallet user sees the held balance of all holds
++  the holds its own scope owns, the wallet user sees the held balance of all holds. The breakdown by identifier is
++  available to the owning scope through `list_holds`
+ - pending - as above, except that outputs expected from *candidate* transactions (see below) are not counted, because
+   candidates in one hold are usually mutually exclusive and at most one of them will settle
+ - total - available + pending + held (for the wallet user); for a scope it is available + pending + held of that scope
+@@ -1075,6 +1079,23 @@ Expiry needs no operation: references are pruned when their validity bound passe
+ and whose candidates all went stale releases its coins by itself. Expiry is evaluated against the wallet clock and
+ SHOULD include the same latency margin used for TTL handling.
+ 
++#### `list_holds`
++
++Reports to the requesting scope what the wallet keeps pinned for it, so that an application can show the user what it
++has reserved and decide whether to reuse an identifier. The scope is derived by the wallet, as for every other
++operation; the wallet user's own scope sees every hold. The report contains, for each identifier of the scope:
++
++- the amount pinned under it, per token type (the sum of the coins carrying at least one reference under the
++  identifier; a coin pinned under several identifiers is counted under each)
++- the number of live candidates, and, for each, its identifying components as they appear in the transaction the scope
++  already holds (value commitments, nullifiers) and its validity bound; nothing the scope does not already know
++- the reservation's `expires_at`, if there is one
++- the number of `outstanding` entries the scope's dropped candidates left on coins, with their validity bounds
++
++The report MUST NOT include coin identifiers, nonces, Merkle indices or any other data the scope did not receive with
++its candidates, and MUST NOT include anything about other scopes' holds; a scope with no holds receives an empty
++report, indistinguishable from a wallet that never had any.
++
+ ## Synchronization process
+ 
+ Literal implementation of a Midnight Wallet, applying transactions one by one, provided by a local node is the best
+-- 
+2.50.1 (Apple Git-155)
+
