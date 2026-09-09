@@ -101,7 +101,7 @@ A **hold** is keyed by (**scope**, **id**).
   network identifiers.
 - The **id** is chosen by the application. It is a label, not a capability: unique only within its scope, shared
   freely by many coins and many transactions, never interpreted by the wallet.
-- A hold has pinned coins (shielded coins, unshielded UTxOs and Dust outputs alike), the candidates built from them,
+- A hold has pinned coins (shielded coins, Dust included, and unshielded UTxOs), the candidates built from them,
   and a policy: `mode` (`single` backs one live candidate, `multi` backs any number of siblings and rebuilds),
   `expires_at`, an optional `note`.
 
@@ -226,9 +226,11 @@ Every candidate has a bound after which the ledger refuses it. The wallet return
 
 | Inputs | Bound | Enforced by |
 |---|---|---|
-| Shielded coins, Dust | commitment-tree root retention: 3600 s hard-coded on ledger v8; `global_ttl` parameter on ledger v9 (code default 3600 s, deployed value to be confirmed on a node 2.x network) | ledger `past_roots` |
-| Unshielded UTxOs, Dust spends | the intent's TTL, chosen at build time within the ledger's allowed margin | ledger intent TTL |
-| Mixed | the minimum of the above | both |
+| Shielded coins, including Dust | commitment-tree root retention: 3600 s hard-coded on ledger v8; `global_ttl` parameter on ledger v9 (code default 3600 s, deployed value to be confirmed on a node 2.x network) | ledger `past_roots` (Dust: its own commitment and generation trees) |
+| Unshielded UTxOs | the TTL of the intent that carries them, chosen at build time within the ledger's allowed margin | ledger intent TTL |
+
+Dust is a shielded coin for every purpose here; the only thing that sets it apart is that it cannot be transferred.
+A candidate that spends both shielded and unshielded inputs is bound by whichever of the two passes first.
 
 A candidate past its bound can never settle, so it becomes `Rejected(stale)` or `Rejected(expired)` and needs no
 `outstanding` entry.
