@@ -6,17 +6,19 @@
 
 ## Summary
 
-Midnight's Zswap was built for offers: a party builds a proven, purposefully unbalanced shielded offer, hands it to
-someone else, and that party merges it with other offers and a contract call into one balanced transaction. Nothing is
-re-proved; offers merge by set union, intents by segment id, and binding randomness adds up.
+Midnight's Zswap was built for offers: a party builds a proven, purposefully unbalanced shielded offer, and whoever
+holds that offer can balance it and complete the transaction, permissionlessly.
 
-Wallets, however, can only reserve a coin for a transaction **they** will submit. This proposal lets a wallet reserve
-coins for offers that **somebody else** will submit, possibly several mutually exclusive offers from the same coins,
-without letting unrelated activity consume the coins in the meantime and without telling any other application that the
-coins are reserved.
+Wallets, however, can only reserve a coin for a transaction they will submit themselves. The reservation exists to
+avoid the case where one coin is sent to two recipients: only the first transaction submitted is accepted, the other is
+rejected.
 
-It does so with **no new coin state and no new transaction status**. Existing states gain metadata; wallets that ignore
-the metadata keep behaving correctly.
+Consider a bid. There are several equivalent items, you want to bid 100 tokens on each of them, and you only have 100
+tokens. We want to enable this use case.
+
+This proposal extends the internal wallet state so that a coin can be reused knowingly, and so that the wallet knows
+when a coin can be reused and when it cannot. It adds no new coin state and no new transaction status: existing states
+gain metadata, and wallets that ignore the metadata keep behaving correctly.
 
 ## The problem
 
