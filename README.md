@@ -35,6 +35,49 @@ transaction settles the coin becomes `Spent`; when the wallet gives up (`discard
 And a privacy requirement: the marketplace that collected the bids may know they conflict, but no other application
 should learn that funds are reserved, for what, or how many offers exist.
 
+## Current states
+
+The wallet specification today tracks coins in five states and transactions in four statuses. Booking is the only
+reservation mechanism: a coin is booked for exactly one transaction and released the moment that transaction is
+discarded.
+
+| Coin state | Meaning | Counted in |
+|---|---|---|
+| `Pending` | expected to be received (change of an own transaction, or `watch_for`) | pending balance |
+| `Confirmed` | received in a transaction added to the chain, not yet final | pending balance |
+| `Final` | received in a finalized transaction | available balance |
+| `Booked` | reserved for one transaction the wallet is building or has submitted | nothing |
+| `Spent` | its nullifier was observed on chain | nothing |
+
+```mermaid
+stateDiagram-v2
+    direction LR
+    [*] --> Pending: spend | watch_for
+    [*] --> Confirmed: apply(receive)
+    Pending --> Confirmed: apply(receive)
+    Pending --> [*]: discard
+    Confirmed --> Final: finalize
+    Confirmed --> Pending: rollback
+    Confirmed --> [*]: discard
+    Final --> Booked: spend | apply(spend)
+    Booked --> Spent: apply
+    Booked --> Booked: rollback
+    Booked --> Final: discard
+    Spent --> Booked: rollback
+    Spent --> Spent: finalize
+```
+
+| Transaction status | Meaning |
+|---|---|
+| `Pending` | built by the wallet (`spend`) or expected (`watch_for`); submitted and re-submitted by the wallet until its TTL |
+| `Confirmed` | observed in a block, with its execution result (success, partial success, failure) |
+| `Final` | confirmed and finalized |
+| `Rejected` | discarded by the wallet, or dropped by a reorganization |
+
+Transitions: `Pending → Confirmed` on `apply`, `Confirmed → Final` on `finalize`, `Confirmed → Pending` on `rollback`,
+`Pending | Confirmed → Rejected` on `discard`. There is no status for a transaction the wallet built but will not
+submit, and a `Rejected` transaction is never expected to confirm.
+
 ## Proposed changes
 
 ### 1. Metadata on existing states
