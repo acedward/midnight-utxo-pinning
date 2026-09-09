@@ -20,6 +20,25 @@ This proposal extends the internal wallet state so that a coin can be reused kno
 when a coin can be reused and when it cannot. It adds no new coin state and no new transaction status: existing states
 gain metadata, and wallets that ignore the metadata keep behaving correctly.
 
+In one table, for a single coin **X**. A, B, C and D are transactions the wallet builds from X and hands to the
+application (candidates). r7 and r8 are identifiers the application chooses. M is the scope: the application's
+identity as authenticated by the wallet, its web origin in a browser.
+
+| Step | X.state | Pins on X: id → live candidates | Outstanding (may still settle) |
+|---|---|---|---|
+| initially | Final | – | – |
+| build A with `use: r7` | Booked | r7 → {A} | – |
+| build B, C with `use: r7` | Booked | r7 → {A, B, C} | – |
+| build D with `use: r7, mark: r8` | Booked | r7 → {A, B, C}, r8 → {D} | – |
+| `detach_transaction(D)` | Booked | r7 → {A, B, C} | D |
+| `detach_transaction({id: r7})` | Final, warning shown | – | A, B, C, D |
+| A's and B's validity bounds pass | Final, warning shown | – | C, D |
+| C settles on chain | Spent | – | – (C `Rejected → Confirmed`, D invalidated) |
+
+An ordinary transfer, from the user or from any other application, never selects X while it is `Booked`. After the
+second detach, X is spendable again; spending it would have cancelled C and D definitively. Had the application known
+that D was never sent anywhere, `detach_transaction(D, { force: true })` would have dropped it without the memory.
+
 ## The problem
 
 The wallet specification reserves coins through *booking*: `spend` moves a coin from `Final` to `Booked`; when the
@@ -84,10 +103,10 @@ submit, and a `Rejected` transaction is never expected to confirm.
 
 | State | Metadata added | Meaning |
 |---|---|---|
-| `Booked` | booking record `{transaction?, hold?}` | `{transaction}` is today's booking. `{hold}` is a **pinned** coin: reserved by a hold, idle, counted only in the owning scope's `held` balance. `{hold, transaction}` is a pinned coin currently booked by a candidate being built |
-| `Final` | `outstanding` list | transactions that could still consume the coin although the wallet no longer intends it to (released candidates, discarded but shared transactions). The coin **is available**; the wallet warns |
+| `Booked` | booking record `{transaction?, holds}` where `holds` maps `(scope, id)` to a set of **references** | `transaction` is today's booking. A reference is one live candidate built from the coin under that id (or a reservation made with `hold`), carrying the candidate's on-chain components and validity bound. A coin with any reference is **pinned**; the count of an id on the coin is the size of its set. Pinned coins count only in the owning scope's `held` balance |
+| `Final` | `outstanding` list | dropped candidates and discarded-but-shared transactions that could still consume the coin. The coin **is available**; the wallet warns |
 | `Pending` | `submitter` = wallet or scope | a scope-submitted pending transaction is a **candidate**: built by the wallet, handed off, never submitted or re-submitted by the wallet, excluded from the pending balance and from TTL discarding |
-| `Rejected` | `reason`, validity bound | `discarded`, `released`, `invalidated`, `stale`, `expired`; keeps the bound while the transaction may still settle |
+| `Rejected` | `reason`, validity bound | `discarded`, `detached`, `invalidated`, `stale`, `expired`; keeps the bound while the transaction may still settle |
 
 One edge is added that today's lifecycle lacks although it already happens in practice: `Rejected → Confirmed` on
 `apply`, for a transaction the wallet gave up on that another party submits before its validity bound passes.
@@ -101,29 +120,35 @@ A **hold** is keyed by (**scope**, **id**).
   network identifiers.
 - The **id** is chosen by the application. It is a label, not a capability: unique only within its scope, shared
   freely by many coins and many transactions, never interpreted by the wallet.
-- A hold has pinned coins (shielded coins, Dust included, and unshielded UTxOs), the candidates built from them,
-  and a policy: `mode` (`single` backs one live candidate, `multi` backs any number of siblings and rebuilds),
-  `expires_at`, an optional `note`.
+- A hold is a policy: `mode` (`single` backs one live candidate, `multi` backs any number of siblings and rebuilds),
+  `expires_at` for reservations, an optional `note`. Its coins (shielded coins, Dust included, and unshielded UTxOs)
+  are found through their booking records; one coin may carry references under several ids of the same scope.
 
 ### 3. Authorization on `spend`
 
-A build may carry an authorization with two optional fields:
+A build may carry `use: X` and, optionally, `mark: Y` (defaulting to X):
 
-- `use: X` — select coins pinned under (scope, X) first; if they do not cover the request, add unpinned coins and pin
-  them under X as well.
-- `mark: Y` — pin whatever this build selects under (scope, Y), creating the hold implicitly (mode `multi`) if needed.
+- If no hold (scope, X) exists yet, it is created implicitly (mode `multi`) and coins are selected from unpinned final
+  coins.
+- Otherwise coins pinned under (scope, X) are selected first; if they do not cover the request, unpinned coins are
+  added.
+- Every selected coin, found or added, gets this build's reference under (scope, Y): the count of Y on the coin grows
+  by one. With the default Y = X that is simply "one more bid with X"; `use: r7, mark: r8` knowingly backs a round-8
+  bid with round-7's coins. Coins pinned only under other ids are never taken.
+- The finished transaction is handed to the scope with its validity bound; the transaction booking is released and the
+  pins keep the coins reserved.
 
 Without an authorization, coin selection works exactly as today and never touches booked coins.
 
-### 4. Three operations
+### 4. Two operations
 
-- `hold(scope, id, selection, policy)` — reserve coins up front without building anything, or set a policy before the
-  first build creates the hold implicitly.
-- `detach_transaction(transaction)` — hand a built transaction to its hold's scope as a candidate: remember its
-  nullifiers, commitments, expected coins and validity bound; mark the scope as submitter; drop the `transaction` field
-  from the inputs' booking records so they stay booked by the hold.
-- `release_hold(scope, id)` — end the hold: candidates become `Rejected(released)`, coins return to `Final` with
-  `outstanding` entries and a warning.
+- `hold(scope, id, selection, policy)` — reserve coins up front without building anything (a `reservation` reference
+  that lapses at `expires_at`), or set `single` mode before the first build creates the hold implicitly.
+- `detach_transaction(transaction | {id}, {force?})` — drop one candidate, or every candidate and the reservation
+  under an id: remove the references from the coins, mark the candidates `Rejected(detached)`, and remember them as
+  `outstanding` while they could still settle. `force: true` skips the memory when the caller knows the candidate was
+  never made public. A coin whose last reference goes returns to `Final` with a warning. Both forms are idempotent.
+  Expiry needs no operation: references are pruned when their validity bound passes.
 
 `apply_transaction`, `rollback_last_transaction` and `discard_transaction` are amended to settle, invalidate and
 restore candidates, and to attach `outstanding` entries where a discarded transaction may have left the wallet.
@@ -141,16 +166,16 @@ sequenceDiagram
     participant S as Settlement<br/>(marketplace backend)
     participant L as Ledger
 
-    M->>W: build bid A (mark "round-7", payFees=false)
-    W->>W: select coin X (150 NIGHT), pin under (M,"round-7")<br/>Booked{hold, transaction}
+    M->>W: build bid A (use "round-7", payFees=false)
+    W->>W: select coin X (150 NIGHT), book it for the build
     W-->>U: confirm hold? (once, per wallet policy)
     U-->>W: yes
     W->>W: prove + bind offer A: +100 NIGHT, −1 TOKEN_A, change 50
-    W->>W: detach A: Pending{submitter=M}, X = Booked{hold}
+    W->>W: hand off A: Pending{submitter=M}<br/>X = Booked{round-7 → {A}}, build booking released
     W-->>M: offer A + validity bound
 
     M->>W: build bid B (use "round-7")
-    W->>W: X selected again, prove, bind, detach
+    W->>W: X selected again, prove, bind, hand off<br/>X = Booked{round-7 → {A, B}}
     W-->>M: offer B
     M->>W: build bid C (use "round-7")
     W-->>M: offer C
@@ -182,15 +207,15 @@ stateDiagram-v2
     state Booked {
         direction TB
         state "by transaction" as ByTx
-        state "by hold (pinned)" as ByHold
-        state "by hold and transaction" as Both
+        state "by holds (pinned)" as ByHold
+        state "by holds and transaction" as Both
         ByHold --> Both: spend(use)
-        Both --> ByHold: detach_transaction | discard
+        Both --> ByHold: hand off | discard
     }
 
     Final --> ByTx: spend
-    Final --> ByHold: hold | spend(mark)
-    ByHold --> Final: release_hold | expiry (+ outstanding)
+    Final --> ByHold: hold | spend(use)
+    ByHold --> Final: last reference dropped (+ outstanding)
     ByTx --> Final: discard (+ outstanding if shared)
     Booked --> Spent: apply
     Final --> Spent: apply (outstanding settled)
@@ -210,14 +235,15 @@ The proposal keeps the user's intent and adds the missing memory:
 
 ```mermaid
 flowchart LR
-    R[release_hold] --> F["Final + outstanding: A, B, C<br/>available, warning shown"]
+    R["detach_transaction({id})"] --> F["Final + outstanding: A, B, C<br/>available, warning shown"]
     F -->|validity bound passes| C1[warning clears]
     F -->|user spends the coin elsewhere| C2["nullifier consumed:<br/>A, B, C definitively cancelled"]
     F -->|marketplace settles B first| C3["coin Spent; B Rejected → Confirmed<br/>recorded as settled after release"]
 ```
 
-Spending the coin is the only definitive cancellation; the wallet may offer release plus an immediate self-transfer as
-a "cancel" convenience.
+Spending the coin is the only definitive cancellation; the wallet may offer detach plus an immediate self-transfer as
+a "cancel" convenience. When the caller knows a candidate was never made public, `force: true` drops it with no
+memory at all.
 
 ### Validity of a candidate
 
@@ -246,8 +272,8 @@ mints the aggregate and absorbs the NIGHT in one merged, all-or-nothing transact
 settles; the others are invalidated automatically.
 
 **Deferred payment with a fixed ceiling.** A service asks the user to pre-authorize up to 50 NIGHT for a session. The
-dApp calls `hold` with an amount, then builds and detaches the final charge later with `use`; the user's remaining
-balance is spendable meanwhile, and the hold expires if nothing is charged.
+dApp calls `hold` with an amount, then builds the final charge later with `use`; the user's remaining balance is
+spendable meanwhile, and the reservation lapses if nothing is charged.
 
 **Order-book style swaps.** Offer files ([MIP-0005](https://github.com/midnightntwrk/midnight-improvement-proposals/blob/main/mips/mip-0005-offer-files.md))
 and P2P swap discovery ([MIP-0006](https://github.com/midnightntwrk/midnight-improvement-proposals/blob/main/mips/mip-0006-p2p-atomic-swaps.md))
@@ -287,6 +313,7 @@ service, expiring at its TTL.
 | [upstream/midnight-wallet-specification.patch](upstream/midnight-wallet-specification.patch) | the proposal as a diff against `midnightntwrk/midnight-wallet` `docs/spec` at `6e1050e5` |
 | [upstream/commits/](upstream/commits/) | the same change as individual commits |
 | [diagrams/](diagrams/) | PlantUML sources and rendered SVGs of the coin and transaction lifecycles |
+| [tools/assemble-spec.py](tools/assemble-spec.py) | regenerates SPECIFICATION.md sections 1–4 from the upstream branch, so the two cannot diverge |
 
 ## Open points for reviewers
 

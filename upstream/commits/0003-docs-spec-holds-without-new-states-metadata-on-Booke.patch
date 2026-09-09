@@ -1,7 +1,7 @@
 From c4471a95d02b2c9cc2ed1354e85f51fd7ab10c81 Mon Sep 17 00:00:00 2001
 From: Eddie <edward.alvarado@midnight.foundation>
 Date: Tue, 8 Sep 2026 19:15:40 -0300
-Subject: [PATCH 3/6] docs(spec): holds without new states - metadata on
+Subject: [PATCH 3/7] docs(spec): holds without new states - metadata on
  Booked, Final, Pending and Rejected
 
 Replaces the Pinned coin state and Detached transaction status with a

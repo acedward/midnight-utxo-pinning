@@ -1,0 +1,512 @@
+From 24d1f0e369585a7c12d80ffd496d3786b16c3954 Mon Sep 17 00:00:00 2001
+From: Eddie <edward.alvarado@midnight.foundation>
+Date: Tue, 8 Sep 2026 23:32:28 -0300
+Subject: [PATCH 7/7] docs(spec): refcount pins per (scope, id); use + optional
+ mark; detach_transaction with force replaces release_hold
+
+---
+ docs/spec/Specification.md    | 297 +++++++++++++++++++---------------
+ docs/spec/coin-lifecycle.puml |  10 +-
+ docs/spec/coin-lifecycle.svg  |   2 +-
+ docs/spec/tx-lifecycle.puml   |   6 +-
+ docs/spec/tx-lifecycle.svg    |   2 +-
+ 5 files changed, 175 insertions(+), 142 deletions(-)
+
+diff --git a/docs/spec/Specification.md b/docs/spec/Specification.md
+index a8fd833..c3b58d9 100644
+--- a/docs/spec/Specification.md
++++ b/docs/spec/Specification.md
+@@ -86,7 +86,6 @@ This document comprises a couple of sections:
+       - [`watch_for`](#watch_for)
+       - [`hold`](#hold)
+       - [`detach_transaction`](#detach_transaction)
+-      - [`release_hold`](#release_hold)
+   - [Synchronization process](#synchronization-process)
+     - [Indexing service for shielded tokens](#indexing-service-for-shielded-tokens)
+     - [Indexing service for unshielded tokens](#indexing-service-for-unshielded-tokens)
+@@ -573,14 +572,14 @@ There are 9 foundational operations defined, which should be atomic to whole wal
+ - `rollback_last_transaction` - which reverts effects of applying last transaction
+ - `discard_transaction(transaction)` - which considers a pending transaction irreversibly failed
+ - `spend(coins_to_spend, new_coins, authorization)` - which spends coins in a new transaction; with an
+-  `authorization` (`use` and/or `mark` hold identifiers) it may spend coins pinned by a hold and pin the coins it
+-  selects
++  `authorization` (`use: id`, optionally `mark: id`) it builds a *candidate*: it may spend coins pinned under that
++  identifier, pins the coins it selects, and hands the result to the requesting scope instead of submitting it
+ - `watch_for(coin)` - which adds a coin to explicitly watch for
+-- `hold(scope, id, selection, policy)` - which pins coins into a scoped hold without building a transaction, so that
++- `hold(scope, id, selection, policy)` - which pins coins under an identifier without building a transaction, so that
+   only builds authorized with that identifier can spend them
+-- `detach_transaction(transaction)` - which hands a built transaction off to its hold's scope as a candidate,
+-  releasing its transaction booking while keeping its inputs booked by the hold
+-- `release_hold(scope, id)` - which ends a hold, returning its pinned coins to ordinary use
++- `detach_transaction(transaction | {id}, {force?})` - which drops one candidate, or every candidate and reservation
++  under an identifier, releasing the pins they kept alive; `force` skips the `outstanding` memory when the caller knows
++  the candidate was never made public
+ 
+ Functions `apply_transaction`, `finalize_transaction` and `rollback_transaction` can be extended to blocks, ranges of
+ blocks or other data to reconstruct the wallet state. Since shielded tokens are implemented using effectively a UTxO
+@@ -684,23 +683,29 @@ A hold is keyed by the pair (owning scope, `id`):
+   its scope (two scopes using the same text have two unrelated holds), it need not be unique per coin or per
+   transaction (many coins may be pinned under one `id`, and many transactions may be built with it), and it is never
+   interpreted by the wallet
+-- the set of **pinned coins** - own, final coins reserved by the hold; shielded coins, unshielded UTxOs and Dust
+-  outputs alike; a coin belongs to at most one hold at a time
+-- the set of **candidate transactions** built from the hold (see below)
+ - a policy:
+-  - `mode` - `single` or `multi`. A `single` hold backs exactly one live candidate: once a candidate is detached, no
+-    further authorized build is accepted until that candidate is settled, invalidated, stale or the hold is released.
+-    A `multi` hold backs any number of sibling candidates from the same coins, including rebuilds of stale ones. The
+-    mode is fixed at creation; a hold created implicitly by a build (see `spend`) is `multi`, because asking to reuse
+-    an `id` is an explicit request for reuse
+-  - `expires_at` - wall-clock instant after which the hold is released automatically; the wallet MAY cap it
++  - `mode` - `single` or `multi`. A `single` hold backs exactly one live candidate: while one exists, no further build
++    with this `id` is accepted. A `multi` hold backs any number of sibling candidates from the same coins, including
++    rebuilds of stale ones. The mode is fixed at creation; a hold created implicitly by a build (see `spend`) is
++    `multi`, because asking to reuse an `id` is an explicit request for reuse
++  - `expires_at` - wall-clock instant after which a reservation made with `hold` lapses; the wallet MAY cap it
+   - an optional free `note`, stored, never interpreted, never leaving the owning scope
+ - creation time and, for auditing by the user, the identity that requested it
+ 
+-A pinned coin is a `Booked` coin whose booking record names the hold (see the lifecycle below). From the ledger's
+-point of view it is an ordinary spendable coin; what changes is only the wallet's willingness to select it: an ordinary
+-spend MUST never select a pinned coin, and a build that says `use: X` MAY select only coins pinned under (scope, `X`)
+-plus, if it needs more value, ordinary unpinned coins, which are then pinned under the same `id`.
++The coins of a hold are not listed in the hold; they are found through their booking records (see the lifecycle
++below). A **pinned** coin is a `Booked` coin whose booking record carries at least one *reference* under some
++(scope, `id`). A reference is what keeps a pin alive:
++
++- a `candidate` reference - one live candidate built from the coin under that `id`, holding the candidate's identifying
++  components, its validity bound and, optionally, the coins it would create for the wallet
++- a `reservation` reference - created by `hold`, holding the hold's `expires_at` as its validity bound
++
++The number of references under (scope, `id`) is the *count* of that identifier on the coin. A coin MAY carry
++references under several identifiers of the same scope (it backs bids in several rounds at once), and MAY still
++carry a `transaction` booking for a wallet-submitted transaction. From the ledger's point of view a pinned coin is an
++ordinary spendable coin; what changes is only the wallet's willingness to select it: an ordinary spend MUST never
++select a booked coin, and a build that says `use: X` MAY select only coins pinned under (scope, `X`) plus, if it
++needs more value, ordinary unpinned coins.
+ 
+ #### Candidate transactions
+ 
+@@ -729,8 +734,9 @@ wallet's signatures and mergeable as a whole. The wallet keeps, for every candid
+   so a candidate past its bound can never settle: the wallet marks it `Rejected(stale)` (root retention) or
+   `Rejected(expired)` (TTL) and needs no `outstanding` entry for it.
+ - its status, which is the ordinary transaction status with extra metadata: *live* is `Pending` with the scope as
+-  submitter; *settled* is `Confirmed`; *invalidated* (one of its inputs was spent by another transaction, e.g. a
+-  sibling candidate), *stale* (validity bound passed) and *released* (hold released) are `Rejected` with that reason.
++  submitter; *settled* is `Confirmed`; *detached* (dropped by the scope or the user, but possibly still valid),
++  *invalidated* (one of its inputs was spent by another transaction, e.g. a sibling candidate), *stale* (root
++  retention passed) and *expired* (intent TTL passed) are `Rejected` with that reason.
+ 
+ Candidates in one hold that share an input nullifier form a **conflict group**: at most one of them can ever settle.
+ This is exactly the property the bidding use cases rely on, and it is visible to the owning scope, which needs it in
+@@ -739,35 +745,67 @@ whole guaranteed section with it).
+ 
+ #### Coin and transaction lifecycle with holds
+ 
+-Holds add **no new coin state and no new transaction status**. They add metadata to three existing ones, so that a
+-wallet which does not implement holds still interprets every state correctly (a booked coin is unavailable, a final coin
+-is available, a pending transaction is in flight):
+-
+-- `Booked` carries a *booking record* with two optional fields, at least one of which is set:
+-  - `transaction` - the pending transaction that booked the coin (the only meaning `Booked` has today);
+-  - `hold` - the hold that reserved the coin. A coin with `hold` set is what this document calls *pinned*.
+-  
+-  The combinations are: `{transaction}` - current behaviour; `{hold}` - pinned and idle; `{hold, transaction}` -
+-  pinned and currently booked by a candidate being built. Transitions: `final -> booked{transaction}` on ordinary
+-  `spend`; `final -> booked{hold}` on `hold`; `booked{hold} -> booked{hold, transaction}` on an authorized `spend`;
+-  `booked{hold, transaction} -> booked{hold}` on `detach_transaction` or on `discard_transaction` of that transaction;
+-  `booked{transaction} -> final` on `discard_transaction`; `booked{hold} -> final` on `release_hold` or hold expiry;
+-  `booked{*} -> spent` on `apply` of any transaction carrying the coin's nullifier; `spent -> booked{*}` on `rollback`,
+-  restoring the previous record verbatim.
+-- `Final` carries an optional list `outstanding`: the identifying components and validity bound of every transaction
+-  that could still consume the coin although the wallet no longer intends it to - candidates of a released hold, and
+-  any discarded transaction that may have left the wallet. The coin **is available**; the wallet MUST show a warning
+-  while the list is non-empty and SHOULD prefer such coins in ordinary coin selection, because spending them is what
+-  actually cancels the outstanding transactions. Entries are dropped when their validity bound passes or when the coin
+-  is spent. A wallet without hold support ignores the list.
+-- `Pending` carries a `submitter`: the wallet (today's meaning) or a scope. A pending transaction whose submitter is a
+-  scope is a live candidate: it is excluded from the wallet's submission and re-submission loop, from the pending
+-  balance (its expected outputs are tracked but not counted), and from TTL-based discarding.
+-- `Rejected` carries a `reason` (`discarded`, `released`, `invalidated`, `stale`, `expired`) and, while relevant, the
+-  validity bound of the transaction. One transition is added that the current lifecycle lacks and that already happens
+-  in practice: `rejected -> confirmed` on `apply`, when a transaction the wallet gave up on is submitted by somebody
+-  else before its validity bound passes. The matching `outstanding` entry on its input coins is what lets the wallet
+-  recognize and explain it.
++Holds add **no new coin state and no new transaction status**. They add metadata to existing ones, so that a wallet
++which does not implement holds still interprets every state correctly (a booked coin is unavailable, a final coin is
++available, a pending transaction is in flight). In language-neutral form:
++
++```text
++Coin
++  state:        Pending | Confirmed | Final | Booked | Spent
++  booking:      BookingRecord      -- present while Booked
++  outstanding:  [Outstanding]      -- may be non-empty in any state; matters while Final
++
++BookingRecord
++  transaction?: TxRef              -- the wallet-submitted transaction that booked the coin (today's booking)
++  holds:        { (scope, id) -> Set<Reference> }   -- pins; the count of X is |holds[(scope, X)]|
++
++Reference
++  kind:         candidate | reservation
++  components:   { nullifiers, valueCommitments, outputCommitments }   -- identifies the candidate on chain
++  validUntil:   Timestamp          -- root retention or intent TTL; for a reservation, the hold's expires_at
++  expected?:    [coin]             -- change and received coins (self outputs can also be rediscovered by
++                                   -- decrypting their ciphertext when the transaction lands)
++
++Outstanding                        -- memory of a dropped candidate that could still consume the coin
++  components, validUntil, scope, id
++
++Transaction
++  status:       Pending | Confirmed | Final | Rejected
++  submitter:    wallet | scope     -- on Pending
++  reason:       discarded | detached | invalidated | stale | expired   -- on Rejected
++```
++
++Invariants:
++
++- A coin is `Booked` if and only if `transaction` is set or some reference set is non-empty. When the last of them
++  goes, the coin returns to `Final`. `spent -> booked` on `rollback` restores the record verbatim.
++- A build with `use: X` (and `mark: Y`, defaulting to `X`) adds one `candidate` reference under (scope, `Y`) to
++  every coin it selects - coins found under `X` and coins it had to add alike - then hands the transaction to the
++  scope; the transaction booking taken during the build is released as part of the handoff. `mark` is how a coin
++  already pinned under one identifier is knowingly pinned under a second one (`use: r7, mark: r8`: bid with round-7's
++  coins in round 8). The candidate is `Pending` with the scope as submitter: excluded from
++  the wallet's submission and re-submission loop, from the pending balance (its expected coins are tracked but not
++  counted) and from TTL-based discarding.
++- `hold` adds one `reservation` reference with `validUntil = expires_at`; an unused reservation keeps the pin until it
++  expires and then releases itself.
++- `detach_transaction(transaction)` removes that candidate's reference from every coin carrying it; the candidate
++  becomes `Rejected(detached)` and, if its validity bound has not passed, an `Outstanding` entry on each of those
++  coins. `detach_transaction({id})` does this for every reference under (scope, `id`) and removes the hold's policy.
++  With `force: true` no `Outstanding` entry is made: the caller asserts the candidate never left its control. Both are
++  idempotent.
++- A reference whose `validUntil` has passed is pruned on every read: the candidate becomes `Rejected(stale)` or
++  `Rejected(expired)`, with no `Outstanding` entry, because the ledger can no longer apply it. A stale candidate
++  therefore never keeps a coin pinned.
++- `Outstanding` entries are kept regardless of the coin's state and dropped when their bound passes or the coin is
++  spent. The coin **is available** while `Final`; the wallet MUST show a warning while entries remain, and MAY prefer
++  such coins in ordinary selection, because spending them is what actually cancels the outstanding transactions.
++- `discard_transaction` of a wallet-submitted transaction removes the `transaction` field and, if the transaction may
++  have left the wallet and its bound has not passed, adds an `Outstanding` entry. Pins are untouched.
++- `apply` of a transaction carrying the coin's nullifier moves the coin to `Spent`. The reference or `Outstanding`
++  entry whose components match the transaction is the settled one: its candidate becomes `Confirmed` (from `Pending`,
++  or from `Rejected` - the one transition added to today's lifecycle, describing what already happens when a
++  transaction the wallet gave up on is submitted by somebody else). Every other reference on the coin becomes
++  `Rejected(invalidated)`.
+ 
+ The two lifecycle figures show the metadata as sub-states of `Booked` and as notes on `Final`, `Pending` and
+ `Rejected`.
+@@ -821,15 +859,14 @@ fallible section.
+ 1. Update coin commitment tree with commitments of outputs and transients present in the offer
+ 2. Verify obtained coin commitment tree root against provided one, implementation needs to revert updates to coin
+    commitment tree and abort in case of inconsistency
+-3. Book coins, whose nullifiers match the ones present in offer inputs. If a matched coin is pinned (booked by a
+-   hold):
+-   1. Find the candidate of its hold whose identifying components (value commitments, output commitments) are present
+-      in the transaction; if one is found, mark it `Confirmed` and confirm the coins it was expected to create
+-   2. Mark every other candidate of the hold that uses the same nullifier as `Rejected(invalidated)`
+-   3. If the hold has no pinned coins left, close it
+-   
+-   If a matched coin is final with `outstanding` entries and one of them matches the transaction, mark that transaction
+-   `Confirmed` (from `Rejected`) and confirm the coins it was expected to create; drop all entries of the coin.
++3. Book coins, whose nullifiers match the ones present in offer inputs. If a matched coin carries references or
++   `outstanding` entries:
++   1. Find the reference or entry whose identifying components (value commitments, output commitments) are present in
++      the transaction; if one is found, mark its candidate `Confirmed` (from `Pending` or from `Rejected`) and confirm
++      the coins it was expected to create
++   2. Mark the candidate of every other reference on the coin `Rejected(invalidated)`; drop the coin's references and
++      entries (the record is kept aside for `rollback`)
++   3. If no coin carries a reference under a hold any more, drop the hold's policy
+ 4. Watch for received coins, for each output:
+    1. Match commitment with a set of pending coins, if there is a match, mark the matching pending coin as confirmed
+    2. If commitment is not a match, try to decrypt output ciphertext, if decryption succeeds - add coin to known set as
+@@ -838,7 +875,7 @@ fallible section.
+ 
+ ##### Steps to apply unshielded offer of a section
+ 
+-1. Book coins spent in the inputs; for pinned coins and for coins with `outstanding` entries apply the same settlement
++1. Book coins spent in the inputs; for coins carrying references or `outstanding` entries apply the same settlement
+    rules as for shielded inputs.
+    Find matching Dust generation infos and set their spent time to timestamp provided
+ 2. Filter outputs to narrow them down to only ones received by tracked addresses, for each one:
+@@ -901,9 +938,9 @@ It needs to:
+    4. Undo setting timestamp on Dust generation info related to Night UTxOs spent in the transaction
+    5. Remove related Dust generation info
+ 3. If transaction settled a candidate or an outstanding transaction: return it to its previous status (`Pending` with
+-   the scope as submitter, or `Rejected`), restore its inputs with their previous booking record or `outstanding`
+-   entries, move the coins it created back to expected ones and restore the sibling candidates it invalidated (they
+-   were invalidated only by this transaction)
++   the scope as submitter, or `Rejected`), restore its inputs' booking records and `outstanding` entries verbatim, move
++   the coins it created back to expected ones and restore the sibling candidates it invalidated (they were invalidated
++   only by this transaction)
+ 4. Otherwise, discard transaction
+ 
+ There are a couple of practical considerations:
+@@ -920,15 +957,14 @@ giving up on submitting one. Following steps need to be taken:
+ 
+ 1. Move transaction to transaction history as failed
+ 2. Remove coins received in the transaction
+-3. Un-book coins spent in the transaction: remove the `transaction` field from each booking record; a coin whose
+-   record still names a hold stays `Booked` by that hold, any other coin returns to `Final`. If the transaction's
+-   validity bound has not passed and the transaction may have left the wallet (it was serialized, exported or handed to
+-   another party), add an `outstanding` entry for it to each such coin
++3. Un-book coins spent in the transaction: remove the `transaction` field from each booking record; a coin that still
++   carries references stays `Booked`, any other coin returns to `Final`. If the transaction's validity bound has not
++   passed and the transaction may have left the wallet (it was serialized, exported or handed to another party), add
++   an `outstanding` entry for it to each such coin
+ 4. Remove related Dust generation info
+ 
+-Discarding applies to transactions the wallet itself submits. Candidates are not discarded - they are released
+-together with their hold (`release_hold`), or become invalidated or stale as described in
+-[Candidate transactions](#candidate-transactions).
++Discarding applies to transactions the wallet itself submits. Candidates are dropped with `detach_transaction`, or
++become invalidated, stale or expired as described in [Candidate transactions](#candidate-transactions).
+ 
+ #### `spend`
+ 
+@@ -939,22 +975,30 @@ In certain situations implementation might allow to use confirmed and yet not fi
+ fail in case of reorganization because of coin commitment tree root mismatch, so a special care should be put into user
+ experience of managing such transactions.
+ 
+-The operation takes an optional `authorization` from the requesting scope, with two optional fields:
+-
+-- `use: X` - select coins pinned under (scope, `X`) first; if they do not cover the request, unpinned final coins MAY be
+-  added, and every added coin is pinned under `X` (or under `mark`, if given) atomically
+-- `mark: Y` - pin every coin selected for this transaction under (scope, `Y`); if no such hold exists it is created
+-  implicitly with the wallet's default policy and mode `multi`. Without `use`, selection is ordinary (unpinned coins
+-  only) and the result is pinned
++The operation takes an optional `authorization` from the requesting scope: `use: X`, and optionally `mark: Y`
++(defaulting to `X`). Resolved within the caller's scope:
++
++1. If no hold (scope, `X`) exists, create it implicitly with mode `multi` and the wallet's default policy, and select
++   coins with ordinary selection from unpinned final coins.
++2. If it exists, select coins pinned under (scope, `X`) first; if they do not cover the request, add unpinned final
++   coins. For a `single` hold that already has a live candidate, refuse.
++   Every selected coin, found or added, is pinned under (scope, `Y`). With the default `Y = X` this simply grows the
++   count of `X`; with `mark: r8` on `use: r7`, round-7's coins knowingly back a round-8 bid as well.
++3. Coins pinned only under other identifiers are never taken, even within the same scope: taking a coin reserved for
++   one round into a bid of another round would create a conflict group the scope did not ask for. A scope that wants
++   that shares the identifier.
++4. Pinning means adding this build's `candidate` reference under (scope, `Y`) to the coin's booking record; the count
++   of `Y` on the coin grows by one. Dust is not a special case: if the build pays fees, Dust outputs pinned under `X` are used
++   first, and any unpinned Dust output it needs is pinned like any other coin.
++5. When the transaction is built (proven, signed where needed, bound), hand it to the scope together with its validity
++   bound and release the transaction booking taken during the build. The transaction is `Pending` with the scope as
++   submitter; the wallet does not submit it.
+ 
+ Without an authorization the spend is *ordinary* and works exactly as today: booked coins, pinned or not, are never
+ eligible, and if the unpinned funds are insufficient the operation fails with an insufficient-funds error that does not
+ reveal whether pinned funds would have covered the shortage. Coins with `outstanding` entries are ordinary final coins;
+-a wallet MAY prefer them, since spending them cancels the outstanding transactions. With an authorization the wallet
+-MUST verify that the scope owns the named holds (an `id` never resolves into another scope), and coins pinned under any
+-other hold remain ineligible. Dust is not a special case: if the build pays fees, Dust outputs pinned under `use` are
+-used first, and any unpinned Dust output it needs is pinned like any other coin. For a `single` hold that already has a
+-live candidate a build with `use` MUST be refused.
++a wallet MAY prefer them, since spending them cancels the outstanding transactions. The wallet MUST verify that an
++identifier resolves within the requesting scope only (an `id` never resolves into another scope).
+ 
+ Following steps need to be taken, from perspective of wallet state:
+ 
+@@ -962,9 +1006,8 @@ Following steps need to be taken, from perspective of wallet state:
+ 2. Prepare change outputs, add them to pending coin pool
+ 3. Prepare transaction, add it to pending transaction pool
+ 
+-A transaction built with an authorization stays in the pending pool like any other until the wallet either submits it
+-or hands it off with `detach_transaction`. Selection, pinning and booking MUST happen in one atomic step, so that two
+-concurrent builds cannot pin or book the same coin.
++Selection, pinning and booking MUST happen in one atomic step, so that two concurrent builds cannot book the same
++coin at the same time (they may, deliberately, pin it under the same identifier one after the other).
+ 
+ #### `watch_for`
+ 
+@@ -979,9 +1022,9 @@ be added as pending one.
+ 
+ #### `hold`
+ 
+-Creates a hold for a scope without building a transaction (see [Holds and pinned coins](#holds-and-pinned-coins)) -
+-for reserving an amount up front, or for setting a policy before the first build with `use`/`mark` would create the
+-hold implicitly. Parameters:
++Reserves coins under an identifier without building a transaction (see [Holds and pinned coins](#holds-and-pinned-coins))
++- to commit an amount up front, or to set a policy (`single` mode, expiry, note) before the first build with `use`
++would create the hold implicitly. Parameters:
+ 
+ - the requesting scope, derived by the wallet
+ - the `id` chosen by the scope; if a hold with that `id` already exists in the scope, the selected coins are added to it
+@@ -992,9 +1035,10 @@ hold implicitly. Parameters:
+ Steps:
+ 
+ 1. Resolve the selection to a set of own **final, unpinned** coins; fail if it cannot be satisfied (the error MUST NOT
+-   reveal whether coins pinned by other holds would have satisfied it)
++   reveal whether coins pinned under other identifiers would have satisfied it)
+ 2. Validate the policy against wallet limits (maximum duration, maximum number of holds per scope, metadata size)
+-3. Atomically create or extend the hold, set the coins to `Booked` with a booking record naming it, and persist
++3. Atomically create or extend the hold, add a `reservation` reference with `validUntil = expires_at` to each coin
++   (setting it to `Booked` if it was `Final`), and persist
+ 
+ Holds MUST be persisted with the rest of the wallet state and MUST be restored before any spend is allowed after a
+ restart. If the persisted hold state cannot be read or validated, the wallet MUST refuse ordinary spends rather than
+@@ -1007,43 +1051,31 @@ the scope rebuilds a stale candidate or builds a sibling.
+ 
+ #### `detach_transaction`
+ 
+-Hands a transaction built with an authorization off to its hold's scope as a candidate. It is the counterpart of
+-`discard_transaction` for the case where the wallet is *not* the submitter. The hold is the one named in the booking
+-records of the transaction's inputs. Steps:
+-
+-1. Verify the transaction is in the pending pool and that its inputs are booked under one hold of the requesting scope
+-2. Record the candidate: identifying components, coins it would create, validity bound; set the transaction's
+-   submitter to the scope
+-3. Remove the `transaction` field from the booking record of each input, so that the inputs are `Booked` by the hold
+-   only; keep the coins it would create as expected ones, excluded from the pending balance
+-4. Any unpinned coin the build had to add is already pinned in the hold (see `spend`); verify this invariant
+-5. Persist atomically, then return the serialized transaction to the scope
+-
+-After `detach_transaction` the same coins can be used again by another authorized build for the same hold if its mode
+-is `multi`, which is how several mutually exclusive candidates are produced from one set of coins; a `single` hold
+-accepts a new build only once its live candidate is no longer `Pending`. The wallet SHOULD warn the user, when
+-presenting a hold, that candidates are outside the wallet's control: they may be submitted by the scope at any time
+-before they become stale, and local release does not revoke them.
+-
+-#### `release_hold`
+-
+-Ends the hold (scope, `id`). Steps:
+-
+-1. Resolve `id` within the requesting scope (the wallet user may release any hold); fail as not found otherwise
+-2. Mark every live candidate `Rejected(released)`, keeping its validity bound
+-3. For every coin booked by the hold: remove the `hold` field from its booking record; if the record is now empty the
+-   coin returns to `Final`, with one `outstanding` entry per candidate that used it and whose validity bound has not
+-   passed
+-4. Persist atomically
+-
+-The coins are available again immediately, as the user intends, but the wallet MUST make it clear that candidates
+-already handed out may still settle until their validity bound passes or the coins are spent: this is what the
+-`outstanding` warning conveys. Spending the coins is the only definitive cancellation; ordinary coin selection SHOULD
+-therefore prefer coins with `outstanding` entries, and the wallet MAY offer a "cancel" convenience that performs the
+-release and a self-transfer of those coins together.
+-
+-A hold whose `expires_at` has passed is released automatically with the same effects. Expiry is evaluated against the
+-wallet clock and SHOULD include the same latency margin used for TTL handling.
++Drops candidates. It is the counterpart of `discard_transaction` for transactions the wallet did not intend to submit.
++Two forms, both resolved within the requesting scope (the wallet user may drop anything):
++
++- `detach_transaction(transaction, {force?})` - drop one candidate. Identify it by its components (the bytes handed
++  back may have been merged with others). Steps:
++  1. Remove the candidate's reference from every coin carrying it
++  2. Mark the candidate `Rejected(detached)`; if its validity bound has not passed and `force` is not set, add an
++     `outstanding` entry for it to each of those coins. `force: true` is the caller's assertion that the candidate was
++     never made public (never sent, never published), so no memory of it is needed; the wallet MAY record the
++     assertion in history and MAY require the wallet user's confirmation when it comes from a scope
++  3. Any coin whose booking record is now empty returns to `Final`
++  4. Persist atomically. Dropping a candidate that is not live is a no-op.
++- `detach_transaction({id}, {force?})` - drop everything under (scope, `id`): every candidate reference, the
++  reservation if any, and the hold's policy, with the same per-candidate effects (`force` applies to all of them).
++  Dropping an unknown identifier is a no-op.
++
++Dropping does not revoke: a candidate already handed out may still settle until its validity bound passes or its coins
++are spent. The coins are available again as soon as nothing else pins them, and the `outstanding` warning is what tells
++the user. Spending the coins is the only definitive cancellation; ordinary coin selection MAY prefer coins with
++`outstanding` entries, and the wallet MAY offer a "cancel" convenience that drops the candidates and self-transfers
++those coins together.
++
++Expiry needs no operation: references are pruned when their validity bound passes, so a hold whose reservation lapsed
++and whose candidates all went stale releases its coins by itself. Expiry is evaluated against the wallet clock and
++SHOULD include the same latency margin used for TTL handling.
+ 
+ ## Synchronization process
+ 
+@@ -1405,7 +1437,8 @@ whether fees are to be paid:
+ 4. Prove, sign the intent (if any) and bind. The result is a transaction whose guaranteed shielded offer and whose
+    intent (if any) are mergeable as a unit by any party: shielded offers merge by set union, intents merge by segment
+    id.
+-5. `detach_transaction` it and return it to the caller together with its validity bound.
++5. Hand it to the caller together with its validity bound (this is the end of the authorized `spend`: the candidate
++   reference is recorded on its inputs and the transaction booking released).
+ 
+ Repeating steps 1-5 with the same `use: X` and different amounts or recipients produces sibling candidates from the
+ same coins (the hold is `multi`). The validity bound of a candidate is the minimum of: the root retention window for its shielded and Dust inputs
+@@ -1481,9 +1514,9 @@ Conceptually, the process follows given steps:
+ 
+ Once transaction is created, it can be submitted to the network or other party.
+ 
+-Pending transactions whose submitter is a scope (candidates, see [`detach_transaction`](#detach_transaction)) are
+-never submitted or re-submitted by the wallet; the scope that received them is responsible for submission, usually
+-after merging them with other transactions.
++Pending transactions whose submitter is a scope (candidates, see [`spend`](#spend)) are never submitted or
++re-submitted by the wallet; the scope that received them is responsible for submission, usually after merging them
++with other transactions.
+ 
+ For cases, where the wallet submits a transaction to the network, it is advised that the wallet implements a
+ re-submission mechanism. A blockchain is a distributed system and there are many possible issues, which may arise due
+diff --git a/docs/spec/coin-lifecycle.puml b/docs/spec/coin-lifecycle.puml
+index f6e92c6..65ff91e 100644
+--- a/docs/spec/coin-lifecycle.puml
++++ b/docs/spec/coin-lifecycle.puml
+@@ -8,10 +8,10 @@ state confirmed as "Confirmed": Coin received in a transaction added to the chai
+ state final as "Final": Coin received in a finalized transaction\nPart of available balance\nMay carry 'outstanding' entries: transactions that\ncould still consume it (warning shown, still available)
+ state booked as "Booked (not part of balance)" {
+   state bookedTx as "by transaction": Booked for a pending transaction\n(current behaviour)
+-  state bookedHold as "by hold": Pinned: reserved by a hold, idle\nIn the owning scope's held balance
+-  state bookedBoth as "by hold and transaction": Pinned and booked by a\ncandidate being built
++  state bookedHold as "by holds": Pinned: references under (scope, id)\ncount = live candidates + reservation\nIn the owning scope's held balance
++  state bookedBoth as "by holds and transaction": Pinned and booked by a\ncandidate being built
+   bookedHold -down-> bookedBoth : spend(use)
+-  bookedBoth -up-> bookedHold : detach_transaction\n| discard
++  bookedBoth -up-> bookedHold : handoff (end of build)\n| discard
+ }
+ note bottom of booked : rollback of a transaction that spent\nbooked coins keeps them booked
+ state spent as "Spent" : Coin spent in a transaction\nNot part of balance
+@@ -24,8 +24,8 @@ confirmed --> pending : rollback
+ confirmed --> [*] : discard
+ pending --> [*] : discard
+ final -down-> bookedTx : spend | apply(spend)
+-final -down-> bookedHold : hold | spend(mark)
+-bookedHold -up-> final : release_hold | expiry\n(+ outstanding entries)
++final -down-> bookedHold : hold | spend(use)
++bookedHold -up-> final : last reference dropped\n(detach_transaction | expiry)\n(+ outstanding entries)
+ bookedTx -up-> final : discard\n(+ outstanding entry if shared)
+ booked -right-> spent : apply
+ final -down-> spent : apply\n(outstanding tx settled)
+diff --git a/docs/spec/coin-lifecycle.svg b/docs/spec/coin-lifecycle.svg
+index df93bac..e80756f 100644
+--- a/docs/spec/coin-lifecycle.svg
++++ b/docs/spec/coin-lifecycle.svg
+@@ -1 +1 @@
+-<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" version="1.1" data-diagram-type="STATE" style="width:2020px;height:760px;background:#FFFFFF;" width="2020px" height="760px" viewBox="0 0 2020 760" zoomAndPan="magnify" preserveAspectRatio="none" contentStyleType="text/css"><?plantuml 1.2026.8?><defs/><g font-family="sans-serif" lengthAdjust="spacing"><!--cluster booked--><g class="cluster" data-qualified-name="booked" id="ent0004" data-source-line="8"><path d="M1338.61,70.14 L1993.05,70.14 A12.5,12.5 0 0 1 2005.55,82.64 L2005.55,91.437 L1326.11,91.437 L1326.11,82.64 A12.5,12.5 0 0 1 1338.61,70.14" fill="#F1F1F1"/><rect x="1326.11" y="70.14" width="679.44" height="269" fill="none" style="stroke:#181818;stroke-width:0.5;" rx="12.5" ry="12.5"/><line x1="1326.11" y1="91.437" x2="2005.55" y2="91.437" style="stroke:#181818;stroke-width:0.5;"/><text x="1565.171" y="87.135" fill="#000" font-size="14" textLength="201.318">Booked (not part of balance)</text></g><g class="entity" data-qualified-name="booked.bookedTx" id="ent0005" data-source-line="9"><rect x="1356.3" y="137.69" width="253.967" height="68.891" fill="#F1F1F1" style="stroke:#181818;stroke-width:0.5;" rx="12.5" ry="12.5"/><line x1="1356.3" y1="163.987" x2="1610.267" y2="163.987" style="stroke:#181818;stroke-width:0.5;"/><text x="1432.93" y="155.685" fill="#000" font-size="14" textLength="100.707">by transaction</text><text x="1361.3" y="181.982" fill="#000" font-size="14" textLength="233.967">Booked for a pending transaction</text><text x="1361.3" y="198.279" fill="#000" font-size="14" textLength="136.753">(current behaviour)</text></g><g class="entity" data-qualified-name="booked.bookedHold" id="ent0006" data-source-line="10"><rect x="1350.11" y="246.69" width="266.347" height="68.891" fill="#F1F1F1" style="stroke:#181818;stroke-width:0.5;" rx="12.5" ry="12.5"/><line x1="1350.11" y1="272.987" x2="1616.457" y2="272.987" style="stroke:#181818;stroke-width:0.5;"/><text x="1457.365" y="264.685" fill="#000" font-size="14" textLength="51.837">by hold</text><text x="1355.11" y="290.982" fill="#000" font-size="14" textLength="222.059">Pinned: reserved by a hold, idle</text><text x="1355.11" y="307.279" fill="#000" font-size="14" textLength="246.347">In the owning scope's held balance</text></g><g class="entity" data-qualified-name="booked.bookedBoth" id="ent0007" data-source-line="11"><rect x="1792.46" y="209.69" width="189.094" height="68.891" fill="#F1F1F1" style="stroke:#181818;stroke-width:0.5;" rx="12.5" ry="12.5"/><line x1="1792.46" y1="235.987" x2="1981.554" y2="235.987" style="stroke:#181818;stroke-width:0.5;"/><text x="1803.926" y="227.685" fill="#000" font-size="14" textLength="166.161">by hold and transaction</text><text x="1797.46" y="253.982" fill="#000" font-size="14" textLength="169.094">Pinned and booked by a</text><text x="1797.46" y="270.279" fill="#000" font-size="14" textLength="148.572">candidate being built</text></g><g class="entity" data-qualified-name="pending" id="ent0001" data-source-line="5"><rect x="695.58" y="661.54" width="364.23" height="85.188" fill="#F1F1F1" style="stroke:#181818;stroke-width:0.5;" rx="12.5" ry="12.5"/><line x1="695.58" y1="687.837" x2="1059.81" y2="687.837" style="stroke:#181818;stroke-width:0.5;"/><text x="849.463" y="679.535" fill="#000" font-size="14" textLength="56.465">Pending</text><text x="700.58" y="705.832" fill="#000" font-size="14" textLength="205.898">Coin expected to be received</text><text x="700.58" y="722.129" fill="#000" font-size="14" textLength="344.23">Part of pending balance (not counted if expected</text><text x="700.58" y="738.426" fill="#000" font-size="14" textLength="256.532">from a scope-submitted transaction)</text></g><g class="entity" data-qualified-name="confirmed" id="ent0002" data-source-line="6"><rect x="171" y="589.69" width="366.281" height="68.891" fill="#F1F1F1" style="stroke:#181818;stroke-width:0.5;" rx="12.5" ry="12.5"/><line x1="171" y1="615.987" x2="537.281" y2="615.987" style="stroke:#181818;stroke-width:0.5;"/><text x="317.678" y="607.685" fill="#000" font-size="14" textLength="72.926">Confirmed</text><text x="176" y="633.982" fill="#000" font-size="14" textLength="346.281">Coin received in a transaction added to the chain</text><text x="176" y="650.279" fill="#000" font-size="14" textLength="167.139">Part of pending balance</text></g><g class="entity" data-qualified-name="final" id="ent0003" data-source-line="7"><rect x="682.28" y="310.39" width="390.829" height="101.484" fill="#F1F1F1" style="stroke:#181818;stroke-width:0.5;" rx="12.5" ry="12.5"/><line x1="682.28" y1="336.687" x2="1073.109" y2="336.687" style="stroke:#181818;stroke-width:0.5;"/><text x="861.052" y="328.385" fill="#000" font-size="14" textLength="33.284">Final</text><text x="687.28" y="354.682" fill="#000" font-size="14" textLength="273.034">Coin received in a finalized transaction</text><text x="687.28" y="370.979" fill="#000" font-size="14" textLength="173.421">Part of available balance</text><text x="687.28" y="387.276" fill="#000" font-size="14" textLength="346.719">May carry 'outstanding' entries: transactions that</text><text x="687.28" y="403.573" fill="#000" font-size="14" textLength="370.829">could still consume it (warning shown, still available)</text></g><g class="entity" data-qualified-name="spent" id="ent0008" data-source-line="16"><rect x="1379.04" y="407.69" width="208.487" height="68.891" fill="#F1F1F1" style="stroke:#181818;stroke-width:0.5;" rx="12.5" ry="12.5"/><line x1="1379.04" y1="433.987" x2="1587.527" y2="433.987" style="stroke:#181818;stroke-width:0.5;"/><text x="1462.909" y="425.685" fill="#000" font-size="14" textLength="40.749">Spent</text><text x="1384.04" y="451.982" fill="#000" font-size="14" textLength="188.487">Coin spent in a transaction</text><text x="1384.04" y="468.279" fill="#000" font-size="14" textLength="135.201">Not part of balance</text></g><g class="start_entity" data-qualified-name=".start." id="ent0012" data-source-line="18"><ellipse cx="16" cy="719.14" rx="10" ry="10" fill="#222" style="stroke:#222;stroke-width:1;"/></g><g class="end_entity" data-qualified-name=".end." id="ent0018" data-source-line="23"><ellipse cx="1483.28" cy="642.14" rx="11" ry="11" fill="none" style="stroke:#222;stroke-width:1;"/><ellipse cx="1483.28" cy="642.14" rx="6" ry="6" fill="#222" style="stroke:#222;stroke-width:1;"/></g><g class="entity" data-qualified-name="GMN32" id="ent0033" data-source-line="15"><path d="M1358.4,6 L1358.4,46.266 L1608.17,46.266 L1608.17,16 L1598.17,6 L1358.4,6" style="stroke:#181818;stroke-width:0.5;" fill="#FEFFDD"/><path d="M1598.17,6 L1598.17,16 L1608.17,16 L1598.17,6" style="stroke:#181818;stroke-width:1;" fill="#FEFFDD"/><text x="1364.4" y="23.067" fill="#000" font-size="13" textLength="228.77">rollback of a transaction that spent</text><text x="1364.4" y="38.2" fill="#000" font-size="13" textLength="218.677">booked coins keeps them booked</text></g><!--link bookedHold to bookedBoth--><g class="link" data-entity-1="ent0006" data-entity-2="ent0007" id="lnk9" data-source-line="12" data-link-type="dependency"><path d="M1616.72,288.61 C1664.46,289.21 1718.6,287.48 1767.46,280.14 C1775.54,278.92 1778.96,278.401 1787.23,276.481" style="stroke:#181818;stroke-width:1;" fill="none" id="bookedHold-to-bookedBoth"/><polygon points="1792.1,275.35,1782.429,273.489,1787.23,276.481,1784.238,281.282,1792.1,275.35" fill="#181818" style="stroke:#181818;stroke-width:1;stroke-linejoin:miter;stroke-miterlimit:10;"/><text x="1668.46" y="276.207" fill="#000" font-size="13" textLength="72.668">spend(use)</text></g><!--reverse link bookedHold to bookedBoth--><g class="link" data-entity-1="ent0006" data-entity-2="ent0007" id="lnk11" data-source-line="13" data-link-type="dependency"><path d="M1621.612,259.355 C1630.002,258.315 1633.36,257.97 1641.46,257.14 C1691.05,252.04 1746.51,248.89 1792.06,246.97" style="stroke:#181818;stroke-width:1;" fill="none" id="bookedHold-backto-bookedBoth"/><polygon points="1616.65,259.97,1626.074,262.832,1621.612,259.355,1625.09,254.893,1616.65,259.97" fill="#181818" style="stroke:#181818;stroke-width:1;stroke-linejoin:miter;stroke-miterlimit:10;"/><text x="1642.46" y="229.447" fill="#000" font-size="13" textLength="124.636">detach_transaction</text><text x="1676.848" y="244.58" fill="#000" font-size="13" textLength="55.859">| discard</text></g><!--link *start* to confirmed--><g class="link" data-entity-1="ent0012" data-entity-2="ent0002" id="lnk13" data-source-line="18" data-link-type="dependency"><path d="M25.99,716.6 C55.12,708.36 144.838,683.01 224.838,660.4" style="stroke:#181818;stroke-width:1;" fill="none" id="*start*-to-confirmed"/><polygon points="229.65,659.04,219.901,657.639,224.838,660.4,222.077,665.337,229.65,659.04" fill="#181818" style="stroke:#181818;stroke-width:1;stroke-linejoin:miter;stroke-miterlimit:10;"/><text x="52" y="679.007" fill="#000" font-size="13" textLength="93.71">apply(receive)</text></g><!--link *start* to pending--><g class="link" data-entity-1="ent0012" data-entity-2="ent0001" id="lnk14" data-source-line="19" data-link-type="dependency"><path d="M26.4,719.2 C84.45,719.59 400.04,721.25 657.28,714.14 C669.67,713.79 677.453,713.562 690.323,713.092" style="stroke:#181818;stroke-width:1;" fill="none" id="*start*-to-pending"/><polygon points="695.32,712.91,686.18,709.241,690.323,713.092,686.472,717.236,695.32,712.91" fill="#181818" style="stroke:#181818;stroke-width:1;stroke-linejoin:miter;stroke-miterlimit:10;"/><text x="296.64" y="712.987" fill="#000" font-size="13" textLength="115.616">spend | watch_for</text></g><!--link pending to confirmed--><g class="link" data-entity-1="ent0001" data-entity-2="ent0002" id="lnk15" data-source-line="20" data-link-type="dependency"><path d="M695.34,674.12 C682.47,672.07 669.68,670.06 657.28,668.14 C618.65,662.15 582.147,656.695 542.707,650.915" style="stroke:#181818;stroke-width:1;" fill="none" id="pending-to-confirmed"/><polygon points="537.76,650.19,546.085,655.453,542.707,650.915,547.245,647.537,537.76,650.19" fill="#181818" style="stroke:#181818;stroke-width:1;stroke-linejoin:miter;stroke-miterlimit:10;"/><text x="563.28" y="650.417" fill="#000" font-size="13" textLength="93.71">apply(receive)</text></g><!--link confirmed to pending--><g class="link" data-entity-1="ent0002" data-entity-2="ent0001" id="lnk17" data-source-line="22" data-link-type="dependency"><path d="M441.38,659.01 C478.03,672.21 521.62,685.81 562.28,693.14 C605.02,700.84 646.534,704.601 690.354,706.431" style="stroke:#181818;stroke-width:1;" fill="none" id="confirmed-to-pending"/><polygon points="695.35,706.64,686.525,702.268,690.354,706.431,686.191,710.261,695.35,706.64" fill="#181818" style="stroke:#181818;stroke-width:1;stroke-linejoin:miter;stroke-miterlimit:10;"/><text x="584.28" y="689.207" fill="#000" font-size="13" textLength="51.416">rollback</text></g><!--link confirmed to final--><g class="link" data-entity-1="ent0002" data-entity-2="ent0003" id="lnk16" data-source-line="21" data-link-type="dependency"><path d="M424.4,589.21 C514.32,543.87 667.476,466.641 770.866,414.501" style="stroke:#181818;stroke-width:1;" fill="none" id="confirmed-to-final"/><polygon points="775.33,412.25,765.493,412.731,770.866,414.501,769.095,419.874,775.33,412.25" fill="#181818" style="stroke:#181818;stroke-width:1;stroke-linejoin:miter;stroke-miterlimit:10;"/><text x="586.78" y="472.957" fill="#000" font-size="13" textLength="46.439">finalize</text></g><!--link confirmed to *end*--><g class="link" data-entity-1="ent0002" data-entity-2="ent0018" id="lnk19" data-source-line="23" data-link-type="dependency"><path d="M537.59,624.74 C728.31,625.73 1036.26,628.32 1302.11,635.14 C1366.89,636.8 1439.716,640.113 1467.136,641.413" style="stroke:#181818;stroke-width:1;" fill="none" id="confirmed-to-*end*"/><polygon points="1472.13,641.65,1463.33,637.228,1467.136,641.413,1462.951,645.219,1472.13,641.65" fill="#181818" style="stroke:#181818;stroke-width:1;stroke-linejoin:miter;stroke-miterlimit:10;"/><text x="854.2" y="621.757" fill="#000" font-size="13" textLength="47.347">discard</text></g><!--link pending to *end*--><g class="link" data-entity-1="ent0001" data-entity-2="ent0018" id="lnk20" data-source-line="24" data-link-type="dependency"><path d="M1060.2,685.49 C1216.43,669.44 1419.116,648.621 1467.116,643.691" style="stroke:#181818;stroke-width:1;" fill="none" id="pending-to-*end*"/><polygon points="1472.09,643.18,1462.728,640.12,1467.116,643.691,1463.546,648.079,1472.09,643.18" fill="#181818" style="stroke:#181818;stroke-width:1;stroke-linejoin:miter;stroke-miterlimit:10;"/><text x="1176.61" y="658.257" fill="#000" font-size="13" textLength="47.347">discard</text></g><!--link final to bookedTx--><g class="link" data-entity-1="ent0003" data-entity-2="ent0005" id="lnk21" data-source-line="25" data-link-type="dependency"><path d="M908.82,310.04 C945.41,253.59 1012.95,165.81 1098.11,129.14 C1181.38,93.28 1214.96,104.14 1302.11,129.14 C1306.14,130.29 1306.23,132.55 1310.11,134.14 C1324.7,140.1 1335.57,143.87 1351.33,148.22" style="stroke:#181818;stroke-width:1;" fill="none" id="final-to-bookedTx"/><polygon points="1356.15,149.55,1348.539,143.3,1351.33,148.22,1346.41,151.011,1356.15,149.55" fill="#181818" style="stroke:#181818;stroke-width:1;stroke-linejoin:miter;stroke-miterlimit:10;"/><text x="1131.61" y="102.207" fill="#000" font-size="13" textLength="137.592">spend | apply(spend)</text></g><!--reverse link final to bookedTx--><g class="link" data-entity-1="ent0003" data-entity-2="ent0005" id="lnk26" data-source-line="28" data-link-type="dependency"><path d="M936.846,306.996 C978.596,271.206 1035.72,229.03 1098.11,206.14 C1144,189.3 1262.5,180.61 1355.87,176.25" style="stroke:#181818;stroke-width:1;" fill="none" id="final-backto-bookedTx"/><polygon points="933.05,310.25,942.486,307.429,936.846,306.996,937.28,301.356,933.05,310.25" fill="#181818" style="stroke:#181818;stroke-width:1;stroke-linejoin:miter;stroke-miterlimit:10;"/><text x="1176.647" y="160.357" fill="#000" font-size="13" textLength="47.347">discard</text><text x="1099.11" y="175.49" fill="#000" font-size="13" textLength="202.42">(+ outstanding entry if shared)</text></g><!--link final to bookedHold--><g class="link" data-entity-1="ent0003" data-entity-2="ent0006" id="lnk22" data-source-line="26" data-link-type="dependency"><path d="M1073.37,331.57 C1081.72,330.39 1090,329.24 1098.11,328.14 C1181.67,316.74 1270.665,305.819 1344.745,297.029" style="stroke:#181818;stroke-width:1;" fill="none" id="final-to-bookedHold"/><polygon points="1349.71,296.44,1340.301,293.528,1344.745,297.029,1341.244,301.473,1349.71,296.44" fill="#181818" style="stroke:#181818;stroke-width:1;stroke-linejoin:miter;stroke-miterlimit:10;"/><text x="1138.61" y="298.817" fill="#000" font-size="13" textLength="123.862">hold | spend(mark)</text></g><!--reverse link final to bookedHold--><g class="link" data-entity-1="ent0003" data-entity-2="ent0006" id="lnk24" data-source-line="27" data-link-type="dependency"><path d="M1078.44,388.256 C1171.7,396.616 1265.88,397.19 1302.11,370.14 C1312.14,362.65 1301.52,352.24 1310.11,343.14 C1321.34,331.24 1335.02,321.62 1349.71,313.84" style="stroke:#181818;stroke-width:1;" fill="none" id="final-backto-bookedHold"/><polygon points="1073.46,387.81,1082.067,392.598,1078.44,388.256,1082.781,384.63,1073.46,387.81" fill="#181818" style="stroke:#181818;stroke-width:1;stroke-linejoin:miter;stroke-miterlimit:10;"/><text x="1132.41" y="351.207" fill="#000" font-size="13" textLength="135.484">release_hold | expiry</text><text x="1124.11" y="366.34" fill="#000" font-size="13" textLength="152.083">(+ outstanding entries)</text></g><!--link booked to spent--><g class="link" data-entity-1="ent0004" data-entity-2="ent0008" id="lnk27" data-source-line="29" data-link-type="dependency"><path d="M1326.052,111.24 C1325.789,111.364 1325.526,111.489 1325.263,111.615 C1324.213,112.119 1323.17,112.635 1322.135,113.164 C1317.994,115.28 1313.975,117.599 1310.11,120.14 C1256.2,155.57 1252.68,182.46 1235.47,244.64 C1213.53,323.9 1297.095,376.063 1374.275,407.313" style="stroke:#181818;stroke-width:1;" fill="none" id="booked-to-spent"/><polygon points="1378.91,409.19,1372.069,402.105,1374.275,407.313,1369.067,409.52,1378.91,409.19" fill="#181818" style="stroke:#181818;stroke-width:1;stroke-linejoin:miter;stroke-miterlimit:10;"/><text x="1182.61" y="257.707" fill="#000" font-size="13" textLength="35.775">apply</text></g><!--link spent to booked--><g class="link" data-entity-1="ent0008" data-entity-2="ent0004" id="lnk29" data-source-line="31" data-link-type="dependency"><path d="M1378.76,408.45 C1279.83,370.2 1152.75,300.74 1198.47,207.14 C1226.08,150.62 1252.1,144.46 1310.11,120.14 C1314.376,118.351 1318.748,116.694 1323.198,115.159 C1323.754,114.967 1324.312,114.777 1324.871,114.589 C1325.15,114.495 1320.685,115.979 1320.965,115.886" style="stroke:#181818;stroke-width:1;" fill="none" id="spent-to-booked"/><polygon points="1325.71,114.308,1315.907,113.353,1320.965,115.886,1318.432,120.944,1325.71,114.308" fill="#181818" style="stroke:#181818;stroke-width:1;stroke-linejoin:miter;stroke-miterlimit:10;"/><text x="1174.701" y="220.207" fill="#000" font-size="13" textLength="51.416">rollback</text><text x="1145.61" y="235.34" fill="#000" font-size="13" textLength="109.599">(restores record)</text></g><!--link final to spent--><g class="link" data-entity-1="ent0003" data-entity-2="ent0008" id="lnk28" data-source-line="30" data-link-type="dependency"><path d="M1008.97,412.36 C1037.89,421.67 1068.7,430.03 1098.11,435.14 C1192.1,451.44 1295.964,451.898 1373.754,448.968" style="stroke:#181818;stroke-width:1;" fill="none" id="final-to-spent"/><polygon points="1378.75,448.78,1369.606,445.122,1373.754,448.968,1369.907,453.116,1378.75,448.78" fill="#181818" style="stroke:#181818;stroke-width:1;stroke-linejoin:miter;stroke-miterlimit:10;"/><text x="1182.596" y="416.207" fill="#000" font-size="13" textLength="35.775">apply</text><text x="1123.61" y="431.34" fill="#000" font-size="13" textLength="153.747">(outstanding tx settled)</text></g><!--link spent to final--><g class="link" data-entity-1="ent0008" data-entity-2="ent0003" id="lnk30" data-source-line="32" data-link-type="dependency"><path d="M1380.45,477.04 C1302.12,498.72 1191.8,517.98 1098.11,492.14 C1041.44,476.51 988.73,444.864 947.12,415.174" style="stroke:#181818;stroke-width:1;" fill="none" id="spent-to-final"/><polygon points="943.05,412.27,948.053,420.754,947.12,415.174,952.7,414.241,943.05,412.27" fill="#181818" style="stroke:#181818;stroke-width:1;stroke-linejoin:miter;stroke-miterlimit:10;"/><text x="1174.834" y="473.207" fill="#000" font-size="13" textLength="51.416">rollback</text><text x="1156.61" y="488.34" fill="#000" font-size="13" textLength="87.864">(outstanding)</text></g><!--link spent to spent--><g class="link" data-entity-1="ent0008" data-entity-2="ent0008" id="lnk31" data-source-line="33" data-link-type="dependency"><path d="M1444.25,407.29 C1435.93,386.84 1448.94,367.69 1483.28,367.69 C1517.63,367.69 1532.524,382.209 1524.204,402.659" style="stroke:#181818;stroke-width:1;" fill="none" id="spent-to-spent"/><polygon points="1522.32,407.29,1529.417,400.461,1524.204,402.659,1522.007,397.446,1522.32,407.29" fill="#181818" style="stroke:#181818;stroke-width:1;stroke-linejoin:miter;stroke-miterlimit:10;"/><text x="1460.28" y="358.757" fill="#000" font-size="13" textLength="46.439">finalize</text></g><!--link booked to GMN32--><g class="link" data-entity-1="ent0004" data-entity-2="ent0033" id="lnk34" data-source-line="15" data-link-type="association"><path d="M1483.28,69.948 C1483.28,69.432 1483.28,68.915 1483.28,68.398 C1483.28,67.364 1483.28,66.331 1483.28,65.297 C1483.28,63.23 1483.28,61.162 1483.28,59.095 C1483.28,54.96 1483.28,50.825 1483.28,46.69" style="stroke:#181818;stroke-width:1;stroke-dasharray:7,7;" fill="none" id="booked-GMN32"/></g><?plantuml-src XLN1Rjim3BtxAuXSccmrqCDsyM675XYsmuO2ssqP2iQYQo6AP4XosspTlu-I9KTEE-nIA2Rr-FZug2hgF7W3Ljxt7eIqr7ffTENsKWzeyG3Q278qmBkhugD5lGyVtrzLbVFe2GRIGkfxG0Uhs-cyQk36I0tqD30gYL1dHy0bI3wGsEfRj1vCDz_TeKBT4goryT2QKOTBifi1jhgpvW08hZK3rMxS7QIFmCp7OMI-INnQepjf3nmCZ6xohymfam0-OtaVK8Y9gkyPfKUf_qaqbUgaHXNBV0odrql49FbhIVQ4Z0ye5UuKPUoj_e97QD7Q8roOqNEfMFi2I7ihoJKba6EswBUQHLC2d9TA1GNSU22G7jQFQ7KWxdhpg2zJmbmpQxOpPfy4kvwESH93ufYORLRmkm8ehtn_YfTsnv8Jwv1GEcDPWIpUelzrErhB7R4nUdoGPhIRC-nFHecCtlEPOM-brYGQLjYH3Gfp26Fm4gHGhDrd7SV7pSQkWrqk7FJ4K7bsoohNnlTb5M2rpvgPgiP04YgKPSt3O4I4ecYEKIhFy0NzMZ2J-aDPgm4N15cFZZPpSepKup2dnjiD2FBOzdSBvPvvMntxGrH_AfvIQCHxteumg8aU2sIKsc6xZmvRk3pO9J9WqwJqbathO4yq13VH8S4aRyJSgD2tS5f1Sldq_NoBjlhhI-DKrOytFw7cvaxBsG0EWpgkqx9ivfJibgGJFCCZUjQ0lLJbs7-WJg6GE6rfCo_YMVXKBujsbX28DRFc9OLbPAgpd3ZlnwcFYMNyjNarEmqzsl0vsUI0Th-fIaj5b-IcB2b2HtVf3Z-OqXvvkzv2yNJaboFZCAibIchXrNl7y12x7Ys9V1_g-5-30IOJf06SzRI8CNG9x9_0aVSgO4vvzQn2CGc-nQlk3Vy9hwgnY_HPWrDsKQFCp5Hc2_m5?></g></svg>
+\ No newline at end of file
++<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" version="1.1" data-diagram-type="STATE" style="width:2061px;height:780px;background:#FFFFFF;" width="2061px" height="780px" viewBox="0 0 2061 780" zoomAndPan="magnify" preserveAspectRatio="none" contentStyleType="text/css"><?plantuml 1.2026.8?><defs/><g font-family="sans-serif" lengthAdjust="spacing"><!--cluster booked--><g class="cluster" data-qualified-name="booked" id="ent0004" data-source-line="8"><path d="M1338.61,70.14 L2034.46,70.14 A12.5,12.5 0 0 1 2046.96,82.64 L2046.96,91.437 L1326.11,91.437 L1326.11,82.64 A12.5,12.5 0 0 1 1338.61,70.14" fill="#F1F1F1"/><rect x="1326.11" y="70.14" width="720.85" height="286" fill="none" style="stroke:#181818;stroke-width:0.5;" rx="12.5" ry="12.5"/><line x1="1326.11" y1="91.437" x2="2046.96" y2="91.437" style="stroke:#181818;stroke-width:0.5;"/><text x="1585.876" y="87.135" fill="#000" font-size="14" textLength="201.318">Booked (not part of balance)</text></g><g class="entity" data-qualified-name="booked.bookedTx" id="ent0005" data-source-line="9"><rect x="1366.32" y="137.69" width="253.967" height="68.891" fill="#F1F1F1" style="stroke:#181818;stroke-width:0.5;" rx="12.5" ry="12.5"/><line x1="1366.32" y1="163.987" x2="1620.287" y2="163.987" style="stroke:#181818;stroke-width:0.5;"/><text x="1442.95" y="155.685" fill="#000" font-size="14" textLength="100.707">by transaction</text><text x="1371.32" y="181.982" fill="#000" font-size="14" textLength="233.967">Booked for a pending transaction</text><text x="1371.32" y="198.279" fill="#000" font-size="14" textLength="136.753">(current behaviour)</text></g><g class="entity" data-qualified-name="booked.bookedHold" id="ent0006" data-source-line="10"><rect x="1350.11" y="246.54" width="286.39" height="85.188" fill="#F1F1F1" style="stroke:#181818;stroke-width:0.5;" rx="12.5" ry="12.5"/><line x1="1350.11" y1="272.837" x2="1636.5" y2="272.837" style="stroke:#181818;stroke-width:0.5;"/><text x="1463.739" y="264.535" fill="#000" font-size="14" textLength="59.131">by holds</text><text x="1355.11" y="290.832" fill="#000" font-size="14" textLength="255.063">Pinned: references under (scope, id)</text><text x="1355.11" y="307.129" fill="#000" font-size="14" textLength="266.39">count = live candidates + reservation</text><text x="1355.11" y="323.426" fill="#000" font-size="14" textLength="246.347">In the owning scope's held balance</text></g><g class="entity" data-qualified-name="booked.bookedBoth" id="ent0007" data-source-line="11"><rect x="1829.5" y="225.69" width="193.455" height="68.891" fill="#F1F1F1" style="stroke:#181818;stroke-width:0.5;" rx="12.5" ry="12.5"/><line x1="1829.5" y1="251.987" x2="2022.955" y2="251.987" style="stroke:#181818;stroke-width:0.5;"/><text x="1839.5" y="243.685" fill="#000" font-size="14" textLength="173.455">by holds and transaction</text><text x="1834.5" y="269.982" fill="#000" font-size="14" textLength="169.094">Pinned and booked by a</text><text x="1834.5" y="286.279" fill="#000" font-size="14" textLength="148.572">candidate being built</text></g><g class="entity" data-qualified-name="pending" id="ent0001" data-source-line="5"><rect x="695.58" y="681.54" width="364.23" height="85.188" fill="#F1F1F1" style="stroke:#181818;stroke-width:0.5;" rx="12.5" ry="12.5"/><line x1="695.58" y1="707.837" x2="1059.81" y2="707.837" style="stroke:#181818;stroke-width:0.5;"/><text x="849.463" y="699.535" fill="#000" font-size="14" textLength="56.465">Pending</text><text x="700.58" y="725.832" fill="#000" font-size="14" textLength="205.898">Coin expected to be received</text><text x="700.58" y="742.129" fill="#000" font-size="14" textLength="344.23">Part of pending balance (not counted if expected</text><text x="700.58" y="758.426" fill="#000" font-size="14" textLength="256.532">from a scope-submitted transaction)</text></g><g class="entity" data-qualified-name="confirmed" id="ent0002" data-source-line="6"><rect x="171" y="609.69" width="366.281" height="68.891" fill="#F1F1F1" style="stroke:#181818;stroke-width:0.5;" rx="12.5" ry="12.5"/><line x1="171" y1="635.987" x2="537.281" y2="635.987" style="stroke:#181818;stroke-width:0.5;"/><text x="317.678" y="627.685" fill="#000" font-size="14" textLength="72.926">Confirmed</text><text x="176" y="653.982" fill="#000" font-size="14" textLength="346.281">Coin received in a transaction added to the chain</text><text x="176" y="670.279" fill="#000" font-size="14" textLength="167.139">Part of pending balance</text></g><g class="entity" data-qualified-name="final" id="ent0003" data-source-line="7"><rect x="682.28" y="330.39" width="390.829" height="101.484" fill="#F1F1F1" style="stroke:#181818;stroke-width:0.5;" rx="12.5" ry="12.5"/><line x1="682.28" y1="356.687" x2="1073.109" y2="356.687" style="stroke:#181818;stroke-width:0.5;"/><text x="861.052" y="348.385" fill="#000" font-size="14" textLength="33.284">Final</text><text x="687.28" y="374.682" fill="#000" font-size="14" textLength="273.034">Coin received in a finalized transaction</text><text x="687.28" y="390.979" fill="#000" font-size="14" textLength="173.421">Part of available balance</text><text x="687.28" y="407.276" fill="#000" font-size="14" textLength="346.719">May carry 'outstanding' entries: transactions that</text><text x="687.28" y="423.573" fill="#000" font-size="14" textLength="370.829">could still consume it (warning shown, still available)</text></g><g class="entity" data-qualified-name="spent" id="ent0008" data-source-line="16"><rect x="1389.06" y="424.69" width="208.487" height="68.891" fill="#F1F1F1" style="stroke:#181818;stroke-width:0.5;" rx="12.5" ry="12.5"/><line x1="1389.06" y1="450.987" x2="1597.547" y2="450.987" style="stroke:#181818;stroke-width:0.5;"/><text x="1472.929" y="442.685" fill="#000" font-size="14" textLength="40.749">Spent</text><text x="1394.06" y="468.982" fill="#000" font-size="14" textLength="188.487">Coin spent in a transaction</text><text x="1394.06" y="485.279" fill="#000" font-size="14" textLength="135.201">Not part of balance</text></g><g class="start_entity" data-qualified-name=".start." id="ent0012" data-source-line="18"><ellipse cx="16" cy="739.14" rx="10" ry="10" fill="#222" style="stroke:#222;stroke-width:1;"/></g><g class="end_entity" data-qualified-name=".end." id="ent0018" data-source-line="23"><ellipse cx="1493.31" cy="662.14" rx="11" ry="11" fill="none" style="stroke:#222;stroke-width:1;"/><ellipse cx="1493.31" cy="662.14" rx="6" ry="6" fill="#222" style="stroke:#222;stroke-width:1;"/></g><g class="entity" data-qualified-name="GMN32" id="ent0033" data-source-line="15"><path d="M1368.42,6 L1368.42,46.266 L1618.19,46.266 L1618.19,16 L1608.19,6 L1368.42,6" style="stroke:#181818;stroke-width:0.5;" fill="#FEFFDD"/><path d="M1608.19,6 L1608.19,16 L1618.19,16 L1608.19,6" style="stroke:#181818;stroke-width:1;" fill="#FEFFDD"/><text x="1374.42" y="23.067" fill="#000" font-size="13" textLength="228.77">rollback of a transaction that spent</text><text x="1374.42" y="38.2" fill="#000" font-size="13" textLength="218.677">booked coins keeps them booked</text></g><!--link bookedHold to bookedBoth--><g class="link" data-entity-1="ent0006" data-entity-2="ent0007" id="lnk9" data-source-line="12" data-link-type="dependency"><path d="M1636.98,302.3 C1689.84,304.57 1750.13,304.07 1804.5,296.14 C1812.62,294.95 1816.063,294.443 1824.373,292.563" style="stroke:#181818;stroke-width:1;" fill="none" id="bookedHold-to-bookedBoth"/><polygon points="1829.25,291.46,1819.589,289.545,1824.373,292.563,1821.354,297.347,1829.25,291.46" fill="#181818" style="stroke:#181818;stroke-width:1;stroke-linejoin:miter;stroke-miterlimit:10;"/><text x="1697" y="292.207" fill="#000" font-size="13" textLength="72.668">spend(use)</text></g><!--reverse link bookedHold to bookedBoth--><g class="link" data-entity-1="ent0006" data-entity-2="ent0007" id="lnk11" data-source-line="13" data-link-type="dependency"><path d="M1641.543,274.662 C1649.973,273.972 1653.36,273.73 1661.5,273.14 C1716.94,269.12 1779.02,265.99 1829.02,263.81" style="stroke:#181818;stroke-width:1;" fill="none" id="bookedHold-backto-bookedBoth"/><polygon points="1636.56,275.07,1645.856,278.322,1641.543,274.662,1645.204,270.349,1636.56,275.07" fill="#181818" style="stroke:#181818;stroke-width:1;stroke-linejoin:miter;stroke-miterlimit:10;"/><text x="1662.5" y="246.277" fill="#000" font-size="13" textLength="141.331">handoff (end of build)</text><text x="1705.236" y="261.41" fill="#000" font-size="13" textLength="55.859">| discard</text></g><!--link *start* to confirmed--><g class="link" data-entity-1="ent0012" data-entity-2="ent0002" id="lnk13" data-source-line="18" data-link-type="dependency"><path d="M25.99,736.6 C55.12,728.36 144.838,703.01 224.838,680.4" style="stroke:#181818;stroke-width:1;" fill="none" id="*start*-to-confirmed"/><polygon points="229.65,679.04,219.901,677.639,224.838,680.4,222.077,685.337,229.65,679.04" fill="#181818" style="stroke:#181818;stroke-width:1;stroke-linejoin:miter;stroke-miterlimit:10;"/><text x="52" y="699.007" fill="#000" font-size="13" textLength="93.71">apply(receive)</text></g><!--link *start* to pending--><g class="link" data-entity-1="ent0012" data-entity-2="ent0001" id="lnk14" data-source-line="19" data-link-type="dependency"><path d="M26.4,739.2 C84.45,739.59 400.04,741.25 657.28,734.14 C669.67,733.79 677.453,733.562 690.323,733.092" style="stroke:#181818;stroke-width:1;" fill="none" id="*start*-to-pending"/><polygon points="695.32,732.91,686.18,729.241,690.323,733.092,686.472,737.236,695.32,732.91" fill="#181818" style="stroke:#181818;stroke-width:1;stroke-linejoin:miter;stroke-miterlimit:10;"/><text x="296.64" y="732.987" fill="#000" font-size="13" textLength="115.616">spend | watch_for</text></g><!--link pending to confirmed--><g class="link" data-entity-1="ent0001" data-entity-2="ent0002" id="lnk15" data-source-line="20" data-link-type="dependency"><path d="M695.34,694.12 C682.47,692.07 669.68,690.06 657.28,688.14 C618.65,682.15 582.147,676.695 542.707,670.915" style="stroke:#181818;stroke-width:1;" fill="none" id="pending-to-confirmed"/><polygon points="537.76,670.19,546.085,675.453,542.707,670.915,547.245,667.537,537.76,670.19" fill="#181818" style="stroke:#181818;stroke-width:1;stroke-linejoin:miter;stroke-miterlimit:10;"/><text x="563.28" y="670.417" fill="#000" font-size="13" textLength="93.71">apply(receive)</text></g><!--link confirmed to pending--><g class="link" data-entity-1="ent0002" data-entity-2="ent0001" id="lnk17" data-source-line="22" data-link-type="dependency"><path d="M441.38,679.01 C478.03,692.21 521.62,705.81 562.28,713.14 C605.02,720.84 646.534,724.601 690.354,726.431" style="stroke:#181818;stroke-width:1;" fill="none" id="confirmed-to-pending"/><polygon points="695.35,726.64,686.525,722.268,690.354,726.431,686.191,730.261,695.35,726.64" fill="#181818" style="stroke:#181818;stroke-width:1;stroke-linejoin:miter;stroke-miterlimit:10;"/><text x="584.28" y="709.207" fill="#000" font-size="13" textLength="51.416">rollback</text></g><!--link confirmed to final--><g class="link" data-entity-1="ent0002" data-entity-2="ent0003" id="lnk16" data-source-line="21" data-link-type="dependency"><path d="M424.4,609.21 C514.32,563.87 667.476,486.641 770.866,434.501" style="stroke:#181818;stroke-width:1;" fill="none" id="confirmed-to-final"/><polygon points="775.33,432.25,765.493,432.731,770.866,434.501,769.095,439.874,775.33,432.25" fill="#181818" style="stroke:#181818;stroke-width:1;stroke-linejoin:miter;stroke-miterlimit:10;"/><text x="586.78" y="492.957" fill="#000" font-size="13" textLength="46.439">finalize</text></g><!--link confirmed to *end*--><g class="link" data-entity-1="ent0002" data-entity-2="ent0018" id="lnk19" data-source-line="23" data-link-type="dependency"><path d="M537.59,644.85 C728.3,645.93 1036.25,648.6 1302.11,655.14 C1370.82,656.83 1448.435,660.166 1477.005,661.446" style="stroke:#181818;stroke-width:1;" fill="none" id="confirmed-to-*end*"/><polygon points="1482,661.67,1473.188,657.271,1477.005,661.446,1472.83,665.263,1482,661.67" fill="#181818" style="stroke:#181818;stroke-width:1;stroke-linejoin:miter;stroke-miterlimit:10;"/><text x="854.2" y="641.917" fill="#000" font-size="13" textLength="47.347">discard</text></g><!--link pending to *end*--><g class="link" data-entity-1="ent0001" data-entity-2="ent0018" id="lnk20" data-source-line="24" data-link-type="dependency"><path d="M1060.31,705.79 C1219.69,689.68 1428.505,668.583 1477.185,663.663" style="stroke:#181818;stroke-width:1;" fill="none" id="pending-to-*end*"/><polygon points="1482.16,663.16,1472.803,660.085,1477.185,663.663,1473.608,668.045,1482.16,663.16" fill="#181818" style="stroke:#181818;stroke-width:1;stroke-linejoin:miter;stroke-miterlimit:10;"/><text x="1176.61" y="678.257" fill="#000" font-size="13" textLength="47.347">discard</text></g><!--link final to bookedTx--><g class="link" data-entity-1="ent0003" data-entity-2="ent0005" id="lnk21" data-source-line="25" data-link-type="dependency"><path d="M906.08,330.03 C941.39,270.19 1009.03,174.15 1098.11,134.14 C1180.81,96.98 1211.88,125.21 1302.11,134.14 C1322.89,136.19 1339.828,138.599 1361.048,142.399" style="stroke:#181818;stroke-width:1;" fill="none" id="final-to-bookedTx"/><polygon points="1365.97,143.28,1357.816,137.756,1361.048,142.399,1356.406,145.631,1365.97,143.28" fill="#181818" style="stroke:#181818;stroke-width:1;stroke-linejoin:miter;stroke-miterlimit:10;"/><text x="1131.61" y="111.527" fill="#000" font-size="13" textLength="137.592">spend | apply(spend)</text></g><!--reverse link final to bookedTx--><g class="link" data-entity-1="ent0003" data-entity-2="ent0005" id="lnk26" data-source-line="28" data-link-type="dependency"><path d="M931.124,326.514 C972.474,286.744 1031.85,237.52 1098.11,211.14 C1145.39,192.31 1269.75,182.22 1366.27,177.05" style="stroke:#181818;stroke-width:1;" fill="none" id="final-backto-bookedTx"/><polygon points="927.52,329.98,936.779,326.624,931.124,326.514,931.234,320.858,927.52,329.98" fill="#181818" style="stroke:#181818;stroke-width:1;stroke-linejoin:miter;stroke-miterlimit:10;"/><text x="1176.647" y="162.717" fill="#000" font-size="13" textLength="47.347">discard</text><text x="1099.11" y="177.85" fill="#000" font-size="13" textLength="202.42">(+ outstanding entry if shared)</text></g><!--link final to bookedHold--><g class="link" data-entity-1="ent0003" data-entity-2="ent0006" id="lnk22" data-source-line="26" data-link-type="dependency"><path d="M1073.5,337.42 C1081.8,335.9 1090.03,334.47 1098.11,333.14 C1181.17,319.45 1269.824,309.289 1344.984,301.899" style="stroke:#181818;stroke-width:1;" fill="none" id="final-to-bookedHold"/><polygon points="1349.96,301.41,1340.612,298.31,1344.984,301.899,1341.395,306.271,1349.96,301.41" fill="#181818" style="stroke:#181818;stroke-width:1;stroke-linejoin:miter;stroke-miterlimit:10;"/><text x="1143.61" y="302.417" fill="#000" font-size="13" textLength="113.369">hold | spend(use)</text></g><!--reverse link final to bookedHold--><g class="link" data-entity-1="ent0003" data-entity-2="ent0006" id="lnk24" data-source-line="27" data-link-type="dependency"><path d="M1078.459,408.633 C1171.879,417.133 1266.22,417.71 1302.11,390.14 C1313.05,381.73 1300.91,370.42 1310.11,360.14 C1321.32,347.61 1335,337.28 1349.78,328.75" style="stroke:#181818;stroke-width:1;" fill="none" id="final-backto-bookedHold"/><polygon points="1073.48,408.18,1082.081,412.979,1078.459,408.633,1082.805,405.012,1073.48,408.18" fill="#181818" style="stroke:#181818;stroke-width:1;stroke-linejoin:miter;stroke-miterlimit:10;"/><text x="1125.788" y="356.207" fill="#000" font-size="13" textLength="148.662">last reference dropped</text><text x="1106.11" y="371.34" fill="#000" font-size="13" textLength="188.018">(detach_transaction | expiry)</text><text x="1124.077" y="386.473" fill="#000" font-size="13" textLength="152.083">(+ outstanding entries)</text></g><!--link booked to spent--><g class="link" data-entity-1="ent0004" data-entity-2="ent0008" id="lnk27" data-source-line="29" data-link-type="dependency"><path d="M1326.042,111.023 C1324.937,111.56 1323.839,112.11 1322.75,112.675 C1318.393,114.933 1314.168,117.415 1310.11,120.14 C1255.26,156.96 1253.91,185.74 1237.14,249.64 C1215.09,333.69 1303.902,389.632 1384.042,422.912" style="stroke:#181818;stroke-width:1;" fill="none" id="booked-to-spent"/><polygon points="1388.66,424.83,1381.882,417.684,1384.042,422.912,1378.814,425.072,1388.66,424.83" fill="#181818" style="stroke:#181818;stroke-width:1;stroke-linejoin:miter;stroke-miterlimit:10;"/><text x="1182.61" y="262.707" fill="#000" font-size="13" textLength="35.775">apply</text></g><!--link spent to booked--><g class="link" data-entity-1="ent0008" data-entity-2="ent0004" id="lnk29" data-source-line="31" data-link-type="dependency"><path d="M1388.57,424.49 C1286.84,384.36 1154.01,310.87 1200.14,212.14 C1227.12,154.4 1251.69,145.58 1310.11,120.14 C1314.592,118.187 1319.19,116.386 1323.874,114.724 C1324.46,114.517 1320.321,115.945 1320.909,115.742" style="stroke:#181818;stroke-width:1;" fill="none" id="spent-to-booked"/><polygon points="1325.635,114.108,1315.822,113.268,1320.909,115.742,1318.436,120.829,1325.635,114.108" fill="#181818" style="stroke:#181818;stroke-width:1;stroke-linejoin:miter;stroke-miterlimit:10;"/><text x="1174.701" y="225.207" fill="#000" font-size="13" textLength="51.416">rollback</text><text x="1145.61" y="240.34" fill="#000" font-size="13" textLength="109.599">(restores record)</text></g><!--link final to spent--><g class="link" data-entity-1="ent0003" data-entity-2="ent0008" id="lnk28" data-source-line="30" data-link-type="dependency"><path d="M992.09,432.29 C1025.54,444.96 1062.69,456.73 1098.11,463.14 C1195.6,480.76 1303.886,477.571 1383.926,471.131" style="stroke:#181818;stroke-width:1;" fill="none" id="final-to-spent"/><polygon points="1388.91,470.73,1379.618,467.465,1383.926,471.131,1380.26,475.439,1388.91,470.73" fill="#181818" style="stroke:#181818;stroke-width:1;stroke-linejoin:miter;stroke-miterlimit:10;"/><text x="1182.596" y="444.207" fill="#000" font-size="13" textLength="35.775">apply</text><text x="1123.61" y="459.34" fill="#000" font-size="13" textLength="153.747">(outstanding tx settled)</text></g><!--link spent to final--><g class="link" data-entity-1="ent0008" data-entity-2="ent0003" id="lnk30" data-source-line="32" data-link-type="dependency"><path d="M1402.44,494.01 C1321.6,520.36 1200.22,547.4 1098.11,518.14 C1039.4,501.31 985.127,466.718 943.417,435.148" style="stroke:#181818;stroke-width:1;" fill="none" id="spent-to-final"/><polygon points="939.43,432.13,944.192,440.751,943.417,435.148,949.02,434.372,939.43,432.13" fill="#181818" style="stroke:#181818;stroke-width:1;stroke-linejoin:miter;stroke-miterlimit:10;"/><text x="1174.834" y="499.207" fill="#000" font-size="13" textLength="51.416">rollback</text><text x="1156.61" y="514.34" fill="#000" font-size="13" textLength="87.864">(outstanding)</text></g><!--link spent to spent--><g class="link" data-entity-1="ent0008" data-entity-2="ent0008" id="lnk31" data-source-line="33" data-link-type="dependency"><path d="M1451,424.29 C1441.98,403.84 1456.09,384.69 1493.31,384.69 C1530.52,384.69 1546.648,399.265 1537.628,419.715" style="stroke:#181818;stroke-width:1;" fill="none" id="spent-to-spent"/><polygon points="1535.61,424.29,1542.902,417.67,1537.628,419.715,1535.582,414.441,1535.61,424.29" fill="#181818" style="stroke:#181818;stroke-width:1;stroke-linejoin:miter;stroke-miterlimit:10;"/><text x="1470.31" y="375.757" fill="#000" font-size="13" textLength="46.439">finalize</text></g><!--link booked to GMN32--><g class="link" data-entity-1="ent0004" data-entity-2="ent0033" id="lnk34" data-source-line="15" data-link-type="association"><path d="M1493.31,69.948 C1493.31,69.432 1493.31,68.915 1493.31,68.398 C1493.31,67.364 1493.31,66.331 1493.31,65.297 C1493.31,63.23 1493.31,61.162 1493.31,59.095 C1493.31,54.96 1493.31,50.825 1493.31,46.69" style="stroke:#181818;stroke-width:1;stroke-dasharray:7,7;" fill="none" id="booked-GMN32"/></g><?plantuml-src XLN1RXCn4BtlLunowOOsKWzmYGI7La9m05M26q5eifxjMd7ibUrD6mZ_pjXhRxoXY4lhn3DlthnvuoXgFNW3LZvs7eIqr7XfTELsKlTeSG_Q27BKm-lRuakBUXU-V7DRLSwZ9-X92waV0Hqi7iRpOWttHcgWvvvHIOGwMm8kGV90OgCVq7emxPIxHOMw8QYryT2OGOSasKu06zrQimS4rvYULcxOxgMFmCp7OMI-J7mQerjfztmP6DtdJvbJ9W5ynZ8VK8YHgkyOfKEf_qaqbMgbHXNBl0-dbql48FbpJlQCZ0UK2hUAClP6Vy8ZD6Zj4QxCuBbKh7q5fBsLvDOba6Esw3UQHLC2d9TA1GNSi2UG7kedj3eGTvrvqZSfOAgPDTiQiqk2tOt7E8a-SKpCbWluLG6KAL-VOzBsM79Y7H9AQomhaCMRzLytWxNS4HkZmuCqWrrUO7ymIcJqZi-ESH-arYJMB75BdDsGWq4Bib17Pzo05Cie1WE_1SLJO2Mvkc1O1zUSvyWUSAJmKSTHip1HeG1mvQ0ZBfldF6TqPtmtOmICVT7vo31U95Kv69bJfi4DHoSDKdd6BtfT2QQoUbSMMuCBwjM3e-KK76zMGp-5nkmrT5p2j2tKd177nYM272TURyU64jNlYiSQkl6Uroc4Z1HPKAFK5fjTjEHiBOA_8WjsMGflsEKETaHzi1_j4qmoKuoDCdq9fmMajHY_lroxZVxyjzEgwjkhxx3Y1i_Rl0RiUtMiqtOjfv1ihwGLdE09VTFzOFDL-Uu_KEUh43YkzNhQt8lhSxqisaL08BQUD2yfp6_6ElEfyqAT-nXPna_B5wFpuCE_KscLqbNHABadXSwVjmU4DNqVtjTQa4SMhPpyARo_qXxPGlKr54zHVebo7IOzhv8wV37l61vsrw4baVDX5N-5663qI9hFHSkpEuOkWVqpEF9U1SmnRZM9L0oAi_W5y8R_X5VQs5buPbz45pNAo4nbSiWV?></g></svg>
+\ No newline at end of file
+diff --git a/docs/spec/tx-lifecycle.puml b/docs/spec/tx-lifecycle.puml
+index b11fa46..9e18556 100644
+--- a/docs/spec/tx-lifecycle.puml
++++ b/docs/spec/tx-lifecycle.puml
+@@ -17,14 +17,14 @@ state final as "Final" {
+   state failureF as "Failure"
+ }
+ 
+-state rejected as "Rejected": reason = discarded | released | invalidated | stale | expired\nkeeps validity bound while it may still settle
++state rejected as "Rejected": reason = discarded | detached | invalidated | stale | expired\nkeeps validity bound while it may still settle
+ 
+-[*] --> pending : spend | watch_for | detach_transaction
++[*] --> pending : spend | watch_for | spend(use)
+ [*] --> confirmed : apply
+ pending --> confirmed : apply
+ confirmed --> final : finalize
+ confirmed --> pending : rollback
+-pending ---> rejected : discard | release_hold | sibling settles | validity bound passes
++pending ---> rejected : discard | detach_transaction | sibling settles | validity bound passes
+ rejected --> confirmed : apply (outstanding transaction settled by another party)
+ confirmed --> rejected : discard
+ 
+diff --git a/docs/spec/tx-lifecycle.svg b/docs/spec/tx-lifecycle.svg
+index 02b84cc..757de84 100644
+--- a/docs/spec/tx-lifecycle.svg
++++ b/docs/spec/tx-lifecycle.svg
+@@ -1 +1 @@
+-<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" version="1.1" data-diagram-type="STATE" style="width:1449px;height:780px;background:#FFFFFF;" width="1449px" height="780px" viewBox="0 0 1449 780" zoomAndPan="magnify" preserveAspectRatio="none" contentStyleType="text/css"><?plantuml 1.2026.8?><defs/><g font-family="sans-serif" lengthAdjust="spacing"><g class="entity" data-qualified-name="confirmed" id="ent0001" data-source-line="6"><path d="M605.48,143 L922.483,143 A12.5,12.5 0 0 1 934.983,155.5 L934.983,169.297 L592.98,169.297 L592.98,155.5 A12.5,12.5 0 0 1 605.48,143" fill="#F1F1F1"/><rect x="592.98" y="143" width="342.003" height="101.297" fill="none" style="stroke:#181818;stroke-width:0.5;" rx="12.5" ry="12.5"/><line x1="592.98" y1="169.297" x2="934.983" y2="169.297" style="stroke:#181818;stroke-width:0.5;"/><text x="727.519" y="160.995" fill="#000" font-size="14" textLength="72.926">Confirmed</text><g class="entity" data-qualified-name="confirmed.success" id="ent0002" data-source-line="7"><rect x="604.98" y="181.297" width="76.355" height="50" fill="#F1F1F1" style="stroke:#181818;stroke-width:0.5;" rx="12.5" ry="12.5"/><line x1="604.98" y1="207.594" x2="681.335" y2="207.594" style="stroke:#181818;stroke-width:0.5;"/><text x="614.98" y="199.292" fill="#000" font-size="14" textLength="56.355">Success</text></g><g class="entity" data-qualified-name="confirmed.partialSuccess" id="ent0003" data-source-line="8"><rect x="699.44" y="181.297" width="125.431" height="50" fill="#F1F1F1" style="stroke:#181818;stroke-width:0.5;" rx="12.5" ry="12.5"/><line x1="699.44" y1="207.594" x2="824.871" y2="207.594" style="stroke:#181818;stroke-width:0.5;"/><text x="709.44" y="199.292" fill="#000" font-size="14" textLength="105.431">Partial Success</text></g><g class="entity" data-qualified-name="confirmed.failure" id="ent0004" data-source-line="9"><rect x="843.33" y="181.297" width="67.653" height="50" fill="#F1F1F1" style="stroke:#181818;stroke-width:0.5;" rx="12.5" ry="12.5"/><line x1="843.33" y1="207.594" x2="910.983" y2="207.594" style="stroke:#181818;stroke-width:0.5;"/><text x="853.33" y="199.292" fill="#000" font-size="14" textLength="47.653">Failure</text></g></g><g class="entity" data-qualified-name="pending" id="ent0005" data-source-line="11"><rect x="7" y="377.5" width="557.968" height="68.891" fill="#F1F1F1" style="stroke:#181818;stroke-width:0.5;" rx="12.5" ry="12.5"/><line x1="7" y1="403.797" x2="564.968" y2="403.797" style="stroke:#181818;stroke-width:0.5;"/><text x="257.751" y="395.495" fill="#000" font-size="14" textLength="56.465">Pending</text><text x="12" y="421.792" fill="#000" font-size="14" textLength="438.033">submitter = wallet (submitted and re-submitted by the wallet)</text><text x="12" y="438.089" fill="#000" font-size="14" textLength="537.968">or submitter = scope (candidate: handed off, never submitted by the wallet)</text></g><g class="entity" data-qualified-name="final" id="ent0006" data-source-line="13"><path d="M1105.48,361.29 L1422.483,361.29 A12.5,12.5 0 0 1 1434.983,373.79 L1434.983,387.587 L1092.98,387.587 L1092.98,373.79 A12.5,12.5 0 0 1 1105.48,361.29" fill="#F1F1F1"/><rect x="1092.98" y="361.29" width="342.003" height="101.297" fill="none" style="stroke:#181818;stroke-width:0.5;" rx="12.5" ry="12.5"/><line x1="1092.98" y1="387.587" x2="1434.983" y2="387.587" style="stroke:#181818;stroke-width:0.5;"/><text x="1247.34" y="379.285" fill="#000" font-size="14" textLength="33.284">Final</text><g class="entity" data-qualified-name="final.successF" id="ent0007" data-source-line="14"><rect x="1104.98" y="399.587" width="76.355" height="50" fill="#F1F1F1" style="stroke:#181818;stroke-width:0.5;" rx="12.5" ry="12.5"/><line x1="1104.98" y1="425.884" x2="1181.335" y2="425.884" style="stroke:#181818;stroke-width:0.5;"/><text x="1114.98" y="417.582" fill="#000" font-size="14" textLength="56.355">Success</text></g><g class="entity" data-qualified-name="final.partialSuccessF" id="ent0008" data-source-line="15"><rect x="1199.44" y="399.587" width="125.431" height="50" fill="#F1F1F1" style="stroke:#181818;stroke-width:0.5;" rx="12.5" ry="12.5"/><line x1="1199.44" y1="425.884" x2="1324.871" y2="425.884" style="stroke:#181818;stroke-width:0.5;"/><text x="1209.44" y="417.582" fill="#000" font-size="14" textLength="105.431">Partial Success</text></g><g class="entity" data-qualified-name="final.failureF" id="ent0009" data-source-line="16"><rect x="1343.33" y="399.587" width="67.653" height="50" fill="#F1F1F1" style="stroke:#181818;stroke-width:0.5;" rx="12.5" ry="12.5"/><line x1="1343.33" y1="425.884" x2="1410.983" y2="425.884" style="stroke:#181818;stroke-width:0.5;"/><text x="1353.33" y="417.582" fill="#000" font-size="14" textLength="47.653">Failure</text></g></g><g class="entity" data-qualified-name="rejected" id="ent0010" data-source-line="19"><rect x="521.9" y="697.59" width="436.172" height="68.891" fill="#F1F1F1" style="stroke:#181818;stroke-width:0.5;" rx="12.5" ry="12.5"/><line x1="521.9" y1="723.887" x2="958.072" y2="723.887" style="stroke:#181818;stroke-width:0.5;"/><text x="709.221" y="715.585" fill="#000" font-size="14" textLength="61.53">Rejected</text><text x="526.9" y="741.882" fill="#000" font-size="14" textLength="416.172">reason = discarded | released | invalidated | stale | expired</text><text x="526.9" y="758.179" fill="#000" font-size="14" textLength="308.383">keeps validity bound while it may still settle</text></g><g class="start_entity" data-qualified-name=".start." id="ent0011" data-source-line="21"><ellipse cx="316.98" cy="16" rx="10" ry="10" fill="#222" style="stroke:#222;stroke-width:1;"/></g><!--link *start* to pending--><g class="link" data-entity-1="ent0011" data-entity-2="ent0005" id="lnk12" data-source-line="21" data-link-type="dependency"><path d="M314.29,26.05 C308.32,46.61 294.12,98.47 288.98,143 C279.3,226.87 281.614,321.505 283.914,372.385" style="stroke:#181818;stroke-width:1;" fill="none" id="*start*-to-pending"/><polygon points="284.14,377.38,287.729,368.209,283.914,372.385,279.738,368.57,284.14,377.38" fill="#181818" style="stroke:#181818;stroke-width:1;stroke-linejoin:miter;stroke-miterlimit:10;"/><text x="289.98" y="198.207" fill="#000" font-size="13" textLength="252.897">spend | watch_for | detach_transaction</text></g><!--link *start* to confirmed--><g class="link" data-entity-1="ent0011" data-entity-2="ent0001" id="lnk13" data-source-line="22" data-link-type="dependency"><path d="M326.32,20.66 C365.75,36.16 517.226,95.682 631.806,140.702" style="stroke:#181818;stroke-width:1;" fill="none" id="*start*-to-confirmed"/><polygon points="636.46,142.53,629.546,135.516,631.806,140.702,626.621,142.962,636.46,142.53" fill="#181818" style="stroke:#181818;stroke-width:1;stroke-linejoin:miter;stroke-miterlimit:10;"/><text x="501.45" y="89.067" fill="#000" font-size="13" textLength="35.775">apply</text></g><!--link pending to confirmed--><g class="link" data-entity-1="ent0005" data-entity-2="ent0001" id="lnk14" data-source-line="23" data-link-type="dependency"><path d="M324.71,377.09 C355.74,351.41 401.32,316.8 445.98,294.29 C491.84,271.18 539.342,253.594 588.082,238.554" style="stroke:#181818;stroke-width:1;" fill="none" id="pending-to-confirmed"/><polygon points="592.86,237.08,583.081,235.912,588.082,238.554,585.44,243.556,592.86,237.08" fill="#181818" style="stroke:#181818;stroke-width:1;stroke-linejoin:miter;stroke-miterlimit:10;"/><text x="446.98" y="307.357" fill="#000" font-size="13" textLength="35.775">apply</text></g><!--link confirmed to pending--><g class="link" data-entity-1="ent0001" data-entity-2="ent0005" id="lnk16" data-source-line="25" data-link-type="dependency"><path d="M653.42,244.67 C563.66,285.29 444.075,339.398 365.555,374.938" style="stroke:#181818;stroke-width:1;" fill="none" id="confirmed-to-pending"/><polygon points="361,377,370.849,376.933,365.555,374.938,367.55,369.645,361,377" fill="#181818" style="stroke:#181818;stroke-width:1;stroke-linejoin:miter;stroke-miterlimit:10;"/><text x="540.32" y="307.357" fill="#000" font-size="13" textLength="51.416">rollback</text></g><!--link confirmed to final--><g class="link" data-entity-1="ent0001" data-entity-2="ent0006" id="lnk15" data-source-line="24" data-link-type="dependency"><path d="M896.85,244.78 C936.09,260.12 978.97,277.41 1017.98,294.29 C1065.92,315.03 1113.806,337.43 1157.866,358.66" style="stroke:#181818;stroke-width:1;" fill="none" id="confirmed-to-final"/><polygon points="1162.37,360.83,1155.998,353.32,1157.866,358.66,1152.526,360.527,1162.37,360.83" fill="#181818" style="stroke:#181818;stroke-width:1;stroke-linejoin:miter;stroke-miterlimit:10;"/><text x="1052.86" y="307.357" fill="#000" font-size="13" textLength="46.439">finalize</text></g><!--link pending to rejected--><g class="link" data-entity-1="ent0005" data-entity-2="ent0010" id="lnk17" data-source-line="26" data-link-type="dependency"><path d="M268.9,446.81 C251.43,486.75 231.14,553.19 263.98,596.59 C297.37,640.71 412.88,673.493 524.22,696.143" style="stroke:#181818;stroke-width:1;" fill="none" id="pending-to-rejected"/><polygon points="529.12,697.14,521.098,691.426,524.22,696.143,519.503,699.266,529.12,697.14" fill="#181818" style="stroke:#181818;stroke-width:1;stroke-linejoin:miter;stroke-miterlimit:10;"/><text x="264.98" y="592.657" fill="#000" font-size="13" textLength="398.633">discard | release_hold | sibling settles | validity bound passes</text></g><!--link rejected to confirmed--><g class="link" data-entity-1="ent0010" data-entity-2="ent0001" id="lnk18" data-source-line="27" data-link-type="dependency"><path d="M781.17,697.41 C794.97,683.6 808.7,666.41 815.98,647.59 C872.67,501.16 853.38,446.79 815.98,294.29 C811.82,277.33 806.567,264.465 798.427,249.155" style="stroke:#181818;stroke-width:1;" fill="none" id="rejected-to-confirmed"/><polygon points="796.08,244.74,796.773,254.564,798.427,249.155,803.837,250.809,796.08,244.74" fill="#181818" style="stroke:#181818;stroke-width:1;stroke-linejoin:miter;stroke-miterlimit:10;"/><text x="851.62" y="525.657" fill="#000" font-size="13" textLength="367.834">apply (outstanding transaction settled by another party)</text></g><!--link confirmed to rejected--><g class="link" data-entity-1="ent0001" data-entity-2="ent0010" id="lnk19" data-source-line="28" data-link-type="dependency"><path d="M761.75,244.62 C756.91,352.69 745.813,600.695 741.723,692.235" style="stroke:#181818;stroke-width:1;" fill="none" id="confirmed-to-rejected"/><polygon points="741.5,697.23,745.898,688.418,741.723,692.235,737.906,688.06,741.5,697.23" fill="#181818" style="stroke:#181818;stroke-width:1;stroke-linejoin:miter;stroke-miterlimit:10;"/><text x="750.64" y="525.657" fill="#000" font-size="13" textLength="47.347">discard</text></g><?plantuml-src ZL9DRzim3BthLn2-D1qQeBiQs2u3SYxQupeKj4pFR1H9a9HcRhl_FjhoH-Rcq9F8H_A9VEHLtBFr6F00XYsbpXDuPxhUKKlCkfeYUVXwUtk61hJx2LKnOIBGpZOS3bG3HYX-J5u1RmeWfyIZrXJZaF2GxM8E2d5YD0zdENSPWW-v3R8v1XgITjakrD-n4K-sPlixCsIxAENlwi0fKO1lS49ZAC5cmgHbMqEWxG9K7QIMniphH-l2VmnHEv5hewMEQ_cqX5PCgNDDSmEMNcZ9NvDDWZLiPRPXXDww8DJkCqhjFYNLRgtLs4IWPz9fNDhzw8XSWJ0wAvFM73M6VhHt0Ot0Wyds1SqmUky9bo5vwO_dGFMZtHFv24CAfmugTnI1JorB5YSuO2SbR0n4IicGKZ-__8BjzlkyEzbNRmhb2PDkdnhH_nrgIYXEakkBg1CxEnSkrrS2UcywDL5TZYv87y-hAFFBhxGABrq5Pqo5Ud_6Bl5Pn7AIQn7hgNLca8WhqnVaYQCWAtKynaXHpLmN-uQDEoPHEtz-9iJ8EzmQMYVd5eOxwQvNitpiLVq3?></g></svg>
+\ No newline at end of file
++<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" version="1.1" data-diagram-type="STATE" style="width:1436px;height:780px;background:#FFFFFF;" width="1436px" height="780px" viewBox="0 0 1436 780" zoomAndPan="magnify" preserveAspectRatio="none" contentStyleType="text/css"><?plantuml 1.2026.8?><defs/><g font-family="sans-serif" lengthAdjust="spacing"><g class="entity" data-qualified-name="confirmed" id="ent0001" data-source-line="6"><path d="M579.48,143 L896.483,143 A12.5,12.5 0 0 1 908.983,155.5 L908.983,169.297 L566.98,169.297 L566.98,155.5 A12.5,12.5 0 0 1 579.48,143" fill="#F1F1F1"/><rect x="566.98" y="143" width="342.003" height="101.297" fill="none" style="stroke:#181818;stroke-width:0.5;" rx="12.5" ry="12.5"/><line x1="566.98" y1="169.297" x2="908.983" y2="169.297" style="stroke:#181818;stroke-width:0.5;"/><text x="701.519" y="160.995" fill="#000" font-size="14" textLength="72.926">Confirmed</text><g class="entity" data-qualified-name="confirmed.success" id="ent0002" data-source-line="7"><rect x="578.98" y="181.297" width="76.355" height="50" fill="#F1F1F1" style="stroke:#181818;stroke-width:0.5;" rx="12.5" ry="12.5"/><line x1="578.98" y1="207.594" x2="655.335" y2="207.594" style="stroke:#181818;stroke-width:0.5;"/><text x="588.98" y="199.292" fill="#000" font-size="14" textLength="56.355">Success</text></g><g class="entity" data-qualified-name="confirmed.partialSuccess" id="ent0003" data-source-line="8"><rect x="673.44" y="181.297" width="125.431" height="50" fill="#F1F1F1" style="stroke:#181818;stroke-width:0.5;" rx="12.5" ry="12.5"/><line x1="673.44" y1="207.594" x2="798.871" y2="207.594" style="stroke:#181818;stroke-width:0.5;"/><text x="683.44" y="199.292" fill="#000" font-size="14" textLength="105.431">Partial Success</text></g><g class="entity" data-qualified-name="confirmed.failure" id="ent0004" data-source-line="9"><rect x="817.33" y="181.297" width="67.653" height="50" fill="#F1F1F1" style="stroke:#181818;stroke-width:0.5;" rx="12.5" ry="12.5"/><line x1="817.33" y1="207.594" x2="884.983" y2="207.594" style="stroke:#181818;stroke-width:0.5;"/><text x="827.33" y="199.292" fill="#000" font-size="14" textLength="47.653">Failure</text></g></g><g class="entity" data-qualified-name="pending" id="ent0005" data-source-line="11"><rect x="7" y="377.5" width="557.968" height="68.891" fill="#F1F1F1" style="stroke:#181818;stroke-width:0.5;" rx="12.5" ry="12.5"/><line x1="7" y1="403.797" x2="564.968" y2="403.797" style="stroke:#181818;stroke-width:0.5;"/><text x="257.751" y="395.495" fill="#000" font-size="14" textLength="56.465">Pending</text><text x="12" y="421.792" fill="#000" font-size="14" textLength="438.033">submitter = wallet (submitted and re-submitted by the wallet)</text><text x="12" y="438.089" fill="#000" font-size="14" textLength="537.968">or submitter = scope (candidate: handed off, never submitted by the wallet)</text></g><g class="entity" data-qualified-name="final" id="ent0006" data-source-line="13"><path d="M1092.48,361.29 L1409.483,361.29 A12.5,12.5 0 0 1 1421.983,373.79 L1421.983,387.587 L1079.98,387.587 L1079.98,373.79 A12.5,12.5 0 0 1 1092.48,361.29" fill="#F1F1F1"/><rect x="1079.98" y="361.29" width="342.003" height="101.297" fill="none" style="stroke:#181818;stroke-width:0.5;" rx="12.5" ry="12.5"/><line x1="1079.98" y1="387.587" x2="1421.983" y2="387.587" style="stroke:#181818;stroke-width:0.5;"/><text x="1234.34" y="379.285" fill="#000" font-size="14" textLength="33.284">Final</text><g class="entity" data-qualified-name="final.successF" id="ent0007" data-source-line="14"><rect x="1091.98" y="399.587" width="76.355" height="50" fill="#F1F1F1" style="stroke:#181818;stroke-width:0.5;" rx="12.5" ry="12.5"/><line x1="1091.98" y1="425.884" x2="1168.335" y2="425.884" style="stroke:#181818;stroke-width:0.5;"/><text x="1101.98" y="417.582" fill="#000" font-size="14" textLength="56.355">Success</text></g><g class="entity" data-qualified-name="final.partialSuccessF" id="ent0008" data-source-line="15"><rect x="1186.44" y="399.587" width="125.431" height="50" fill="#F1F1F1" style="stroke:#181818;stroke-width:0.5;" rx="12.5" ry="12.5"/><line x1="1186.44" y1="425.884" x2="1311.871" y2="425.884" style="stroke:#181818;stroke-width:0.5;"/><text x="1196.44" y="417.582" fill="#000" font-size="14" textLength="105.431">Partial Success</text></g><g class="entity" data-qualified-name="final.failureF" id="ent0009" data-source-line="16"><rect x="1330.33" y="399.587" width="67.653" height="50" fill="#F1F1F1" style="stroke:#181818;stroke-width:0.5;" rx="12.5" ry="12.5"/><line x1="1330.33" y1="425.884" x2="1397.983" y2="425.884" style="stroke:#181818;stroke-width:0.5;"/><text x="1340.33" y="417.582" fill="#000" font-size="14" textLength="47.653">Failure</text></g></g><g class="entity" data-qualified-name="rejected" id="ent0010" data-source-line="19"><rect x="506.2" y="697.59" width="441.565" height="68.891" fill="#F1F1F1" style="stroke:#181818;stroke-width:0.5;" rx="12.5" ry="12.5"/><line x1="506.2" y1="723.887" x2="947.765" y2="723.887" style="stroke:#181818;stroke-width:0.5;"/><text x="696.218" y="715.585" fill="#000" font-size="14" textLength="61.53">Rejected</text><text x="511.2" y="741.882" fill="#000" font-size="14" textLength="421.565">reason = discarded | detached | invalidated | stale | expired</text><text x="511.2" y="758.179" fill="#000" font-size="14" textLength="308.383">keeps validity bound while it may still settle</text></g><g class="start_entity" data-qualified-name=".start." id="ent0011" data-source-line="21"><ellipse cx="342.98" cy="16" rx="10" ry="10" fill="#222" style="stroke:#222;stroke-width:1;"/></g><!--link *start* to pending--><g class="link" data-entity-1="ent0011" data-entity-2="ent0005" id="lnk12" data-source-line="21" data-link-type="dependency"><path d="M340.6,26.1 C335.26,46.74 322.27,98.77 314.98,143 C301.18,226.79 292.757,321.465 288.807,372.375" style="stroke:#181818;stroke-width:1;" fill="none" id="*start*-to-pending"/><polygon points="288.42,377.36,293.104,368.696,288.807,372.375,285.128,368.078,288.42,377.36" fill="#181818" style="stroke:#181818;stroke-width:1;stroke-linejoin:miter;stroke-miterlimit:10;"/><text x="315.98" y="198.207" fill="#000" font-size="13" textLength="200.929">spend | watch_for | spend(use)</text></g><!--link *start* to confirmed--><g class="link" data-entity-1="ent0011" data-entity-2="ent0001" id="lnk13" data-source-line="22" data-link-type="dependency"><path d="M351.98,20.99 C388.03,37.03 520.481,95.929 621.061,140.649" style="stroke:#181818;stroke-width:1;" fill="none" id="*start*-to-confirmed"/><polygon points="625.63,142.68,619.031,135.369,621.061,140.649,615.781,142.679,625.63,142.68" fill="#181818" style="stroke:#181818;stroke-width:1;stroke-linejoin:miter;stroke-miterlimit:10;"/><text x="506.1" y="89.067" fill="#000" font-size="13" textLength="35.775">apply</text></g><!--link pending to confirmed--><g class="link" data-entity-1="ent0005" data-entity-2="ent0001" id="lnk14" data-source-line="23" data-link-type="dependency"><path d="M324.05,377.02 C354.29,351.48 398.57,317.08 441.98,294.29 C480.87,273.88 520.05,258.031 561.92,243.681" style="stroke:#181818;stroke-width:1;" fill="none" id="pending-to-confirmed"/><polygon points="566.65,242.06,556.839,241.194,561.92,243.681,559.433,248.762,566.65,242.06" fill="#181818" style="stroke:#181818;stroke-width:1;stroke-linejoin:miter;stroke-miterlimit:10;"/><text x="442.98" y="307.357" fill="#000" font-size="13" textLength="35.775">apply</text></g><!--link confirmed to pending--><g class="link" data-entity-1="ent0001" data-entity-2="ent0005" id="lnk16" data-source-line="25" data-link-type="dependency"><path d="M636.87,244.76 C594.65,265.53 545.03,289.77 499.98,311.29 C453.39,333.56 405.358,355.941 363.988,375.071" style="stroke:#181818;stroke-width:1;" fill="none" id="confirmed-to-pending"/><polygon points="359.45,377.17,369.298,377.023,363.988,375.071,365.94,369.762,359.45,377.17" fill="#181818" style="stroke:#181818;stroke-width:1;stroke-linejoin:miter;stroke-miterlimit:10;"/><text x="533.48" y="307.357" fill="#000" font-size="13" textLength="51.416">rollback</text></g><!--link confirmed to final--><g class="link" data-entity-1="ent0001" data-entity-2="ent0006" id="lnk15" data-source-line="24" data-link-type="dependency"><path d="M879.18,244.77 C920.05,259.97 964.54,277.19 1004.98,294.29 C1053.42,314.77 1101.709,337.303 1145.929,358.693" style="stroke:#181818;stroke-width:1;" fill="none" id="confirmed-to-final"/><polygon points="1150.43,360.87,1144.07,353.35,1145.929,358.693,1140.586,360.552,1150.43,360.87" fill="#181818" style="stroke:#181818;stroke-width:1;stroke-linejoin:miter;stroke-miterlimit:10;"/><text x="1039.95" y="307.357" fill="#000" font-size="13" textLength="46.439">finalize</text></g><!--link pending to rejected--><g class="link" data-entity-1="ent0005" data-entity-2="ent0010" id="lnk17" data-source-line="26" data-link-type="dependency"><path d="M252.04,446.81 C217.09,485.86 172.37,550.57 207.98,596.59 C245.55,645.12 377.216,678.463 500.836,700.223" style="stroke:#181818;stroke-width:1;" fill="none" id="pending-to-rejected"/><polygon points="505.76,701.09,497.59,695.59,500.836,700.223,496.203,703.469,505.76,701.09" fill="#181818" style="stroke:#181818;stroke-width:1;stroke-linejoin:miter;stroke-miterlimit:10;"/><text x="208.98" y="592.657" fill="#000" font-size="13" textLength="441.022">discard | detach_transaction | sibling settles | validity bound passes</text></g><!--link rejected to confirmed--><g class="link" data-entity-1="ent0010" data-entity-2="ent0001" id="lnk18" data-source-line="27" data-link-type="dependency"><path d="M768.17,697.41 C781.97,683.6 795.7,666.41 802.98,647.59 C859.67,501.16 847.73,444.8 802.98,294.29 C797.8,276.87 791.255,263.823 781.285,248.723" style="stroke:#181818;stroke-width:1;" fill="none" id="rejected-to-confirmed"/><polygon points="778.53,244.55,780.151,254.265,781.285,248.723,786.827,249.857,778.53,244.55" fill="#181818" style="stroke:#181818;stroke-width:1;stroke-linejoin:miter;stroke-miterlimit:10;"/><text x="840.51" y="525.657" fill="#000" font-size="13" textLength="367.834">apply (outstanding transaction settled by another party)</text></g><!--link confirmed to rejected--><g class="link" data-entity-1="ent0001" data-entity-2="ent0010" id="lnk19" data-source-line="28" data-link-type="dependency"><path d="M736.96,244.62 C734.74,352.69 729.652,600.691 727.782,692.231" style="stroke:#181818;stroke-width:1;" fill="none" id="confirmed-to-rejected"/><polygon points="727.68,697.23,731.863,688.314,727.782,692.231,723.865,688.15,727.68,697.23" fill="#181818" style="stroke:#181818;stroke-width:1;stroke-linejoin:miter;stroke-miterlimit:10;"/><text x="732.41" y="525.657" fill="#000" font-size="13" textLength="47.347">discard</text></g><?plantuml-src ZLDDRzim3BthLn2-B1aMeBiQs2u3SXxMupeKj4pFR1H9aEHcthh_FjhoH-Rcq9FvyVX4FjBluecjnu1dC6mfzPx0EzCFZbfprjKKoSF7kxkhQ41xcgCg9am4sjc6mvbgm0Z5bzahu8y2o93OQKqnZe3xR1TBKeWJexc_mdpD8NY5RP1D5sW47RDTgBzJ8vvipVPdPiXsKShRrPbJeW2Vu8B6K8BT79EMRGs13ckWwY6rD27t3zQ5_nYYTYBNJaiTr_9e2QsOKkUQvWDOUgOLloMR1MlOocpZ28DrGwZZMvGwlacgurQhgOb0JwJJjBHlaoDo1SBeh4nQSzGOXj5UeAQ4kXrDjizenj47JxWCoPT-UGvKFzWJaOymGZZrKBbE1BwqB2XESCPUIjWOY9II8QM-l_y1XyFdPNUohy4KoWictJuselzBZkswIFkbOBsw4j1xqwkPudPsZGpvl88oV_atRT9hDy4PKw4-NR5BVX6ld6LQH7fCyej4r8b5HUcSApEKvNcZH3RQU8oHebeORtOFEzSbqJgtSFr2vXql3QsJOmlZbVJxpKIlErR_0000?></g></svg>
+\ No newline at end of file
+-- 
+2.50.1 (Apple Git-155)
+

@@ -8,10 +8,10 @@ state confirmed as "Confirmed": Coin received in a transaction added to the chai
 state final as "Final": Coin received in a finalized transaction\nPart of available balance\nMay carry 'outstanding' entries: transactions that\ncould still consume it (warning shown, still available)
 state booked as "Booked (not part of balance)" {
   state bookedTx as "by transaction": Booked for a pending transaction\n(current behaviour)
-  state bookedHold as "by hold": Pinned: reserved by a hold, idle\nIn the owning scope's held balance
-  state bookedBoth as "by hold and transaction": Pinned and booked by a\ncandidate being built
+  state bookedHold as "by holds": Pinned: references under (scope, id)\ncount = live candidates + reservation\nIn the owning scope's held balance
+  state bookedBoth as "by holds and transaction": Pinned and booked by a\ncandidate being built
   bookedHold -down-> bookedBoth : spend(use)
-  bookedBoth -up-> bookedHold : detach_transaction\n| discard
+  bookedBoth -up-> bookedHold : handoff (end of build)\n| discard
 }
 note bottom of booked : rollback of a transaction that spent\nbooked coins keeps them booked
 state spent as "Spent" : Coin spent in a transaction\nNot part of balance
@@ -24,8 +24,8 @@ confirmed --> pending : rollback
 confirmed --> [*] : discard
 pending --> [*] : discard
 final -down-> bookedTx : spend | apply(spend)
-final -down-> bookedHold : hold | spend(mark)
-bookedHold -up-> final : release_hold | expiry\n(+ outstanding entries)
+final -down-> bookedHold : hold | spend(use)
+bookedHold -up-> final : last reference dropped\n(detach_transaction | expiry)\n(+ outstanding entries)
 bookedTx -up-> final : discard\n(+ outstanding entry if shared)
 booked -right-> spent : apply
 final -down-> spent : apply\n(outstanding tx settled)

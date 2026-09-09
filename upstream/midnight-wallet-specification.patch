@@ -1,5 +1,5 @@
 diff --git a/docs/spec/Specification.md b/docs/spec/Specification.md
-index f30fd3b..a8fd833 100644
+index f30fd3b..c3b58d9 100644
 --- a/docs/spec/Specification.md
 +++ b/docs/spec/Specification.md
 @@ -67,6 +67,12 @@ This document comprises a couple of sections:
@@ -15,17 +15,16 @@ index f30fd3b..a8fd833 100644
      - [Operations](#operations)
        - [`apply_transaction`](#apply_transaction)
          - [Steps to apply shielded offer of a section](#steps-to-apply-shielded-offer-of-a-section)
-@@ -78,6 +84,9 @@ This document comprises a couple of sections:
+@@ -78,6 +84,8 @@ This document comprises a couple of sections:
        - [`discard_transaction`](#discard_transaction)
        - [`spend`](#spend)
        - [`watch_for`](#watch_for)
 +      - [`hold`](#hold)
 +      - [`detach_transaction`](#detach_transaction)
-+      - [`release_hold`](#release_hold)
    - [Synchronization process](#synchronization-process)
      - [Indexing service for shielded tokens](#indexing-service-for-shielded-tokens)
      - [Indexing service for unshielded tokens](#indexing-service-for-unshielded-tokens)
-@@ -100,6 +109,7 @@ This document comprises a couple of sections:
+@@ -100,6 +108,7 @@ This document comprises a couple of sections:
      - [Building stages](#building-stages)
        - [Prepare transfer](#prepare-transfer)
        - [Prepare a swap](#prepare-a-swap)
@@ -33,7 +32,7 @@ index f30fd3b..a8fd833 100644
        - [Contract call](#contract-call)
        - [Balance transaction](#balance-transaction)
    - [Transaction submission](#transaction-submission)
-@@ -516,6 +526,10 @@ Because a transaction can always be extended (by adding new intents or merging s
+@@ -516,6 +525,10 @@ Because a transaction can always be extended (by adding new intents or merging s
  reliable identifier to use when looking for transaction confirmation. Instead, transactions should be identified by
  their known components: value commitments of shielded offers or binding commitments of intents.
  
@@ -44,7 +43,7 @@ index f30fd3b..a8fd833 100644
  ### Mint claim
  
  A system transaction can be issued by Midnight nodes to mint certain amount of tokens as a reward a party. Such minted
-@@ -541,6 +555,8 @@ consists of the data needed to spend coins and pay fees
+@@ -541,6 +554,8 @@ consists of the data needed to spend coins and pay fees
  - a set of own Dust outputs paired with Dust actions containing them
  - a Merkle tree of Dust generation infos
  - a Merkle tree of Dust commitments
@@ -53,7 +52,7 @@ index f30fd3b..a8fd833 100644
  
  Owned coins do not have to be spendable at particular point. They might also be coins that the wallet was let know of,
  which are expected to be included in one of the future transactions.
-@@ -548,7 +564,7 @@ which are expected to be included in one of the future transactions.
+@@ -548,7 +563,7 @@ which are expected to be included in one of the future transactions.
  Additionally, it is in practice important to track progress of synchronization with chain, pool of pending transactions
  and transaction history.
  
@@ -62,24 +61,24 @@ index f30fd3b..a8fd833 100644
  
  - `apply_transaction(transaction, status, timestamp, expected_roots,  genearations_tree_update)` - which updates the
    state with a transaction observed on chain, this operation allows to learn about incoming tokens
-@@ -556,8 +572,15 @@ There are 6 foundational operations defined, which should be atomic to whole wal
+@@ -556,8 +571,15 @@ There are 6 foundational operations defined, which should be atomic to whole wal
  - `finalize_transaction(transaction)` - which marks transaction as final according to consensus rules
  - `rollback_last_transaction` - which reverts effects of applying last transaction
  - `discard_transaction(transaction)` - which considers a pending transaction irreversibly failed
 -- `spend(coins_to_spend, new_coins)` - which spends coins in a new transaction
 +- `spend(coins_to_spend, new_coins, authorization)` - which spends coins in a new transaction; with an
-+  `authorization` (`use` and/or `mark` hold identifiers) it may spend coins pinned by a hold and pin the coins it
-+  selects
++  `authorization` (`use: id`, optionally `mark: id`) it builds a *candidate*: it may spend coins pinned under that
++  identifier, pins the coins it selects, and hands the result to the requesting scope instead of submitting it
  - `watch_for(coin)` - which adds a coin to explicitly watch for
-+- `hold(scope, id, selection, policy)` - which pins coins into a scoped hold without building a transaction, so that
++- `hold(scope, id, selection, policy)` - which pins coins under an identifier without building a transaction, so that
 +  only builds authorized with that identifier can spend them
-+- `detach_transaction(transaction)` - which hands a built transaction off to its hold's scope as a candidate,
-+  releasing its transaction booking while keeping its inputs booked by the hold
-+- `release_hold(scope, id)` - which ends a hold, returning its pinned coins to ordinary use
++- `detach_transaction(transaction | {id}, {force?})` - which drops one candidate, or every candidate and reservation
++  under an identifier, releasing the pins they kept alive; `force` skips the `outstanding` memory when the caller knows
++  the candidate was never made public
  
  Functions `apply_transaction`, `finalize_transaction` and `rollback_transaction` can be extended to blocks, ranges of
  blocks or other data to reconstruct the wallet state. Since shielded tokens are implemented using effectively a UTxO
-@@ -590,11 +613,188 @@ distinct balances recognized:
+@@ -590,11 +612,227 @@ distinct balances recognized:
  - total - sum of available and pending balances; it represents total amount of tokens under wallet's control, taking
    into consideration known pending transactions and coins
  
@@ -154,23 +153,29 @@ index f30fd3b..a8fd833 100644
 +  its scope (two scopes using the same text have two unrelated holds), it need not be unique per coin or per
 +  transaction (many coins may be pinned under one `id`, and many transactions may be built with it), and it is never
 +  interpreted by the wallet
-+- the set of **pinned coins** - own, final coins reserved by the hold; shielded coins, unshielded UTxOs and Dust
-+  outputs alike; a coin belongs to at most one hold at a time
-+- the set of **candidate transactions** built from the hold (see below)
 +- a policy:
-+  - `mode` - `single` or `multi`. A `single` hold backs exactly one live candidate: once a candidate is detached, no
-+    further authorized build is accepted until that candidate is settled, invalidated, stale or the hold is released.
-+    A `multi` hold backs any number of sibling candidates from the same coins, including rebuilds of stale ones. The
-+    mode is fixed at creation; a hold created implicitly by a build (see `spend`) is `multi`, because asking to reuse
-+    an `id` is an explicit request for reuse
-+  - `expires_at` - wall-clock instant after which the hold is released automatically; the wallet MAY cap it
++  - `mode` - `single` or `multi`. A `single` hold backs exactly one live candidate: while one exists, no further build
++    with this `id` is accepted. A `multi` hold backs any number of sibling candidates from the same coins, including
++    rebuilds of stale ones. The mode is fixed at creation; a hold created implicitly by a build (see `spend`) is
++    `multi`, because asking to reuse an `id` is an explicit request for reuse
++  - `expires_at` - wall-clock instant after which a reservation made with `hold` lapses; the wallet MAY cap it
 +  - an optional free `note`, stored, never interpreted, never leaving the owning scope
 +- creation time and, for auditing by the user, the identity that requested it
 +
-+A pinned coin is a `Booked` coin whose booking record names the hold (see the lifecycle below). From the ledger's
-+point of view it is an ordinary spendable coin; what changes is only the wallet's willingness to select it: an ordinary
-+spend MUST never select a pinned coin, and a build that says `use: X` MAY select only coins pinned under (scope, `X`)
-+plus, if it needs more value, ordinary unpinned coins, which are then pinned under the same `id`.
++The coins of a hold are not listed in the hold; they are found through their booking records (see the lifecycle
++below). A **pinned** coin is a `Booked` coin whose booking record carries at least one *reference* under some
++(scope, `id`). A reference is what keeps a pin alive:
++
++- a `candidate` reference - one live candidate built from the coin under that `id`, holding the candidate's identifying
++  components, its validity bound and, optionally, the coins it would create for the wallet
++- a `reservation` reference - created by `hold`, holding the hold's `expires_at` as its validity bound
++
++The number of references under (scope, `id`) is the *count* of that identifier on the coin. A coin MAY carry
++references under several identifiers of the same scope (it backs bids in several rounds at once), and MAY still
++carry a `transaction` booking for a wallet-submitted transaction. From the ledger's point of view a pinned coin is an
++ordinary spendable coin; what changes is only the wallet's willingness to select it: an ordinary spend MUST never
++select a booked coin, and a build that says `use: X` MAY select only coins pinned under (scope, `X`) plus, if it
++needs more value, ordinary unpinned coins.
 +
 +#### Candidate transactions
 +
@@ -199,8 +204,9 @@ index f30fd3b..a8fd833 100644
 +  so a candidate past its bound can never settle: the wallet marks it `Rejected(stale)` (root retention) or
 +  `Rejected(expired)` (TTL) and needs no `outstanding` entry for it.
 +- its status, which is the ordinary transaction status with extra metadata: *live* is `Pending` with the scope as
-+  submitter; *settled* is `Confirmed`; *invalidated* (one of its inputs was spent by another transaction, e.g. a
-+  sibling candidate), *stale* (validity bound passed) and *released* (hold released) are `Rejected` with that reason.
++  submitter; *settled* is `Confirmed`; *detached* (dropped by the scope or the user, but possibly still valid),
++  *invalidated* (one of its inputs was spent by another transaction, e.g. a sibling candidate), *stale* (root
++  retention passed) and *expired* (intent TTL passed) are `Rejected` with that reason.
 +
 +Candidates in one hold that share an input nullifier form a **conflict group**: at most one of them can ever settle.
 +This is exactly the property the bidding use cases rely on, and it is visible to the owning scope, which needs it in
@@ -209,35 +215,67 @@ index f30fd3b..a8fd833 100644
 +
 +#### Coin and transaction lifecycle with holds
 +
-+Holds add **no new coin state and no new transaction status**. They add metadata to three existing ones, so that a
-+wallet which does not implement holds still interprets every state correctly (a booked coin is unavailable, a final coin
-+is available, a pending transaction is in flight):
++Holds add **no new coin state and no new transaction status**. They add metadata to existing ones, so that a wallet
++which does not implement holds still interprets every state correctly (a booked coin is unavailable, a final coin is
++available, a pending transaction is in flight). In language-neutral form:
 +
-+- `Booked` carries a *booking record* with two optional fields, at least one of which is set:
-+  - `transaction` - the pending transaction that booked the coin (the only meaning `Booked` has today);
-+  - `hold` - the hold that reserved the coin. A coin with `hold` set is what this document calls *pinned*.
-+  
-+  The combinations are: `{transaction}` - current behaviour; `{hold}` - pinned and idle; `{hold, transaction}` -
-+  pinned and currently booked by a candidate being built. Transitions: `final -> booked{transaction}` on ordinary
-+  `spend`; `final -> booked{hold}` on `hold`; `booked{hold} -> booked{hold, transaction}` on an authorized `spend`;
-+  `booked{hold, transaction} -> booked{hold}` on `detach_transaction` or on `discard_transaction` of that transaction;
-+  `booked{transaction} -> final` on `discard_transaction`; `booked{hold} -> final` on `release_hold` or hold expiry;
-+  `booked{*} -> spent` on `apply` of any transaction carrying the coin's nullifier; `spent -> booked{*}` on `rollback`,
-+  restoring the previous record verbatim.
-+- `Final` carries an optional list `outstanding`: the identifying components and validity bound of every transaction
-+  that could still consume the coin although the wallet no longer intends it to - candidates of a released hold, and
-+  any discarded transaction that may have left the wallet. The coin **is available**; the wallet MUST show a warning
-+  while the list is non-empty and SHOULD prefer such coins in ordinary coin selection, because spending them is what
-+  actually cancels the outstanding transactions. Entries are dropped when their validity bound passes or when the coin
-+  is spent. A wallet without hold support ignores the list.
-+- `Pending` carries a `submitter`: the wallet (today's meaning) or a scope. A pending transaction whose submitter is a
-+  scope is a live candidate: it is excluded from the wallet's submission and re-submission loop, from the pending
-+  balance (its expected outputs are tracked but not counted), and from TTL-based discarding.
-+- `Rejected` carries a `reason` (`discarded`, `released`, `invalidated`, `stale`, `expired`) and, while relevant, the
-+  validity bound of the transaction. One transition is added that the current lifecycle lacks and that already happens
-+  in practice: `rejected -> confirmed` on `apply`, when a transaction the wallet gave up on is submitted by somebody
-+  else before its validity bound passes. The matching `outstanding` entry on its input coins is what lets the wallet
-+  recognize and explain it.
++```text
++Coin
++  state:        Pending | Confirmed | Final | Booked | Spent
++  booking:      BookingRecord      -- present while Booked
++  outstanding:  [Outstanding]      -- may be non-empty in any state; matters while Final
++
++BookingRecord
++  transaction?: TxRef              -- the wallet-submitted transaction that booked the coin (today's booking)
++  holds:        { (scope, id) -> Set<Reference> }   -- pins; the count of X is |holds[(scope, X)]|
++
++Reference
++  kind:         candidate | reservation
++  components:   { nullifiers, valueCommitments, outputCommitments }   -- identifies the candidate on chain
++  validUntil:   Timestamp          -- root retention or intent TTL; for a reservation, the hold's expires_at
++  expected?:    [coin]             -- change and received coins (self outputs can also be rediscovered by
++                                   -- decrypting their ciphertext when the transaction lands)
++
++Outstanding                        -- memory of a dropped candidate that could still consume the coin
++  components, validUntil, scope, id
++
++Transaction
++  status:       Pending | Confirmed | Final | Rejected
++  submitter:    wallet | scope     -- on Pending
++  reason:       discarded | detached | invalidated | stale | expired   -- on Rejected
++```
++
++Invariants:
++
++- A coin is `Booked` if and only if `transaction` is set or some reference set is non-empty. When the last of them
++  goes, the coin returns to `Final`. `spent -> booked` on `rollback` restores the record verbatim.
++- A build with `use: X` (and `mark: Y`, defaulting to `X`) adds one `candidate` reference under (scope, `Y`) to
++  every coin it selects - coins found under `X` and coins it had to add alike - then hands the transaction to the
++  scope; the transaction booking taken during the build is released as part of the handoff. `mark` is how a coin
++  already pinned under one identifier is knowingly pinned under a second one (`use: r7, mark: r8`: bid with round-7's
++  coins in round 8). The candidate is `Pending` with the scope as submitter: excluded from
++  the wallet's submission and re-submission loop, from the pending balance (its expected coins are tracked but not
++  counted) and from TTL-based discarding.
++- `hold` adds one `reservation` reference with `validUntil = expires_at`; an unused reservation keeps the pin until it
++  expires and then releases itself.
++- `detach_transaction(transaction)` removes that candidate's reference from every coin carrying it; the candidate
++  becomes `Rejected(detached)` and, if its validity bound has not passed, an `Outstanding` entry on each of those
++  coins. `detach_transaction({id})` does this for every reference under (scope, `id`) and removes the hold's policy.
++  With `force: true` no `Outstanding` entry is made: the caller asserts the candidate never left its control. Both are
++  idempotent.
++- A reference whose `validUntil` has passed is pruned on every read: the candidate becomes `Rejected(stale)` or
++  `Rejected(expired)`, with no `Outstanding` entry, because the ledger can no longer apply it. A stale candidate
++  therefore never keeps a coin pinned.
++- `Outstanding` entries are kept regardless of the coin's state and dropped when their bound passes or the coin is
++  spent. The coin **is available** while `Final`; the wallet MUST show a warning while entries remain, and MAY prefer
++  such coins in ordinary selection, because spending them is what actually cancels the outstanding transactions.
++- `discard_transaction` of a wallet-submitted transaction removes the `transaction` field and, if the transaction may
++  have left the wallet and its bound has not passed, adds an `Outstanding` entry. Pins are untouched.
++- `apply` of a transaction carrying the coin's nullifier moves the coin to `Spent`. The reference or `Outstanding`
++  entry whose components match the transaction is the settled one: its candidate becomes `Confirmed` (from `Pending`,
++  or from `Rejected` - the one transition added to today's lifecycle, describing what already happens when a
++  transaction the wallet gave up on is submitted by somebody else). Every other reference on the coin becomes
++  `Rejected(invalidated)`.
 +
 +The two lifecycle figures show the metadata as sub-states of `Booked` and as notes on `Final`, `Pending` and
 +`Rejected`.
@@ -268,85 +306,91 @@ index f30fd3b..a8fd833 100644
  ### Operations
  
  #### `apply_transaction`
-@@ -621,7 +821,15 @@ fallible section.
+@@ -621,7 +859,14 @@ fallible section.
  1. Update coin commitment tree with commitments of outputs and transients present in the offer
  2. Verify obtained coin commitment tree root against provided one, implementation needs to revert updates to coin
     commitment tree and abort in case of inconsistency
 -3. Book coins, whose nullifiers match the ones present in offer inputs
-+3. Book coins, whose nullifiers match the ones present in offer inputs. If a matched coin is pinned (booked by a
-+   hold):
-+   1. Find the candidate of its hold whose identifying components (value commitments, output commitments) are present
-+      in the transaction; if one is found, mark it `Confirmed` and confirm the coins it was expected to create
-+   2. Mark every other candidate of the hold that uses the same nullifier as `Rejected(invalidated)`
-+   3. If the hold has no pinned coins left, close it
-+   
-+   If a matched coin is final with `outstanding` entries and one of them matches the transaction, mark that transaction
-+   `Confirmed` (from `Rejected`) and confirm the coins it was expected to create; drop all entries of the coin.
++3. Book coins, whose nullifiers match the ones present in offer inputs. If a matched coin carries references or
++   `outstanding` entries:
++   1. Find the reference or entry whose identifying components (value commitments, output commitments) are present in
++      the transaction; if one is found, mark its candidate `Confirmed` (from `Pending` or from `Rejected`) and confirm
++      the coins it was expected to create
++   2. Mark the candidate of every other reference on the coin `Rejected(invalidated)`; drop the coin's references and
++      entries (the record is kept aside for `rollback`)
++   3. If no coin carries a reference under a hold any more, drop the hold's policy
  4. Watch for received coins, for each output:
     1. Match commitment with a set of pending coins, if there is a match, mark the matching pending coin as confirmed
     2. If commitment is not a match, try to decrypt output ciphertext, if decryption succeeds - add coin to known set as
-@@ -630,7 +838,9 @@ fallible section.
+@@ -630,7 +875,9 @@ fallible section.
  
  ##### Steps to apply unshielded offer of a section
  
 -1. Book coins spent in the inputs. Find matching Dust generation infos and set their spent time to timestamp provided
-+1. Book coins spent in the inputs; for pinned coins and for coins with `outstanding` entries apply the same settlement
++1. Book coins spent in the inputs; for coins carrying references or `outstanding` entries apply the same settlement
 +   rules as for shielded inputs.
 +   Find matching Dust generation infos and set their spent time to timestamp provided
  2. Filter outputs to narrow them down to only ones received by tracked addresses, for each one:
     1. Match the coin with pending ones, if there is a match, mark the matching pending coin as confirmed.
     2. Otherwise, add a coin to the known set as a confirmed.
-@@ -690,7 +900,11 @@ It needs to:
+@@ -690,7 +937,11 @@ It needs to:
     3. Restore coins spent in the transaction in a booked state
     4. Undo setting timestamp on Dust generation info related to Night UTxOs spent in the transaction
     5. Remove related Dust generation info
 -3. Otherwise, discard transaction
 +3. If transaction settled a candidate or an outstanding transaction: return it to its previous status (`Pending` with
-+   the scope as submitter, or `Rejected`), restore its inputs with their previous booking record or `outstanding`
-+   entries, move the coins it created back to expected ones and restore the sibling candidates it invalidated (they
-+   were invalidated only by this transaction)
++   the scope as submitter, or `Rejected`), restore its inputs' booking records and `outstanding` entries verbatim, move
++   the coins it created back to expected ones and restore the sibling candidates it invalidated (they were invalidated
++   only by this transaction)
 +4. Otherwise, discard transaction
  
  There are a couple of practical considerations:
  
-@@ -706,9 +920,16 @@ giving up on submitting one. Following steps need to be taken:
+@@ -706,9 +957,15 @@ giving up on submitting one. Following steps need to be taken:
  
  1. Move transaction to transaction history as failed
  2. Remove coins received in the transaction
 -3. Un-book coins spent in the transaction
-+3. Un-book coins spent in the transaction: remove the `transaction` field from each booking record; a coin whose
-+   record still names a hold stays `Booked` by that hold, any other coin returns to `Final`. If the transaction's
-+   validity bound has not passed and the transaction may have left the wallet (it was serialized, exported or handed to
-+   another party), add an `outstanding` entry for it to each such coin
++3. Un-book coins spent in the transaction: remove the `transaction` field from each booking record; a coin that still
++   carries references stays `Booked`, any other coin returns to `Final`. If the transaction's validity bound has not
++   passed and the transaction may have left the wallet (it was serialized, exported or handed to another party), add
++   an `outstanding` entry for it to each such coin
  4. Remove related Dust generation info
  
-+Discarding applies to transactions the wallet itself submits. Candidates are not discarded - they are released
-+together with their hold (`release_hold`), or become invalidated or stale as described in
-+[Candidate transactions](#candidate-transactions).
++Discarding applies to transactions the wallet itself submits. Candidates are dropped with `detach_transaction`, or
++become invalidated, stale or expired as described in [Candidate transactions](#candidate-transactions).
 +
  #### `spend`
  
  Spend coins in a transaction, either by initiating swap, making transfer or balancing other transaction. Only final
-@@ -718,12 +939,33 @@ In certain situations implementation might allow to use confirmed and yet not fi
+@@ -718,12 +975,40 @@ In certain situations implementation might allow to use confirmed and yet not fi
  fail in case of reorganization because of coin commitment tree root mismatch, so a special care should be put into user
  experience of managing such transactions.
  
-+The operation takes an optional `authorization` from the requesting scope, with two optional fields:
++The operation takes an optional `authorization` from the requesting scope: `use: X`, and optionally `mark: Y`
++(defaulting to `X`). Resolved within the caller's scope:
 +
-+- `use: X` - select coins pinned under (scope, `X`) first; if they do not cover the request, unpinned final coins MAY be
-+  added, and every added coin is pinned under `X` (or under `mark`, if given) atomically
-+- `mark: Y` - pin every coin selected for this transaction under (scope, `Y`); if no such hold exists it is created
-+  implicitly with the wallet's default policy and mode `multi`. Without `use`, selection is ordinary (unpinned coins
-+  only) and the result is pinned
++1. If no hold (scope, `X`) exists, create it implicitly with mode `multi` and the wallet's default policy, and select
++   coins with ordinary selection from unpinned final coins.
++2. If it exists, select coins pinned under (scope, `X`) first; if they do not cover the request, add unpinned final
++   coins. For a `single` hold that already has a live candidate, refuse.
++   Every selected coin, found or added, is pinned under (scope, `Y`). With the default `Y = X` this simply grows the
++   count of `X`; with `mark: r8` on `use: r7`, round-7's coins knowingly back a round-8 bid as well.
++3. Coins pinned only under other identifiers are never taken, even within the same scope: taking a coin reserved for
++   one round into a bid of another round would create a conflict group the scope did not ask for. A scope that wants
++   that shares the identifier.
++4. Pinning means adding this build's `candidate` reference under (scope, `Y`) to the coin's booking record; the count
++   of `Y` on the coin grows by one. Dust is not a special case: if the build pays fees, Dust outputs pinned under `X` are used
++   first, and any unpinned Dust output it needs is pinned like any other coin.
++5. When the transaction is built (proven, signed where needed, bound), hand it to the scope together with its validity
++   bound and release the transaction booking taken during the build. The transaction is `Pending` with the scope as
++   submitter; the wallet does not submit it.
 +
 +Without an authorization the spend is *ordinary* and works exactly as today: booked coins, pinned or not, are never
 +eligible, and if the unpinned funds are insufficient the operation fails with an insufficient-funds error that does not
 +reveal whether pinned funds would have covered the shortage. Coins with `outstanding` entries are ordinary final coins;
-+a wallet MAY prefer them, since spending them cancels the outstanding transactions. With an authorization the wallet
-+MUST verify that the scope owns the named holds (an `id` never resolves into another scope), and coins pinned under any
-+other hold remain ineligible. Dust is not a special case: if the build pays fees, Dust outputs pinned under `use` are
-+used first, and any unpinned Dust output it needs is pinned like any other coin. For a `single` hold that already has a
-+live candidate a build with `use` MUST be refused.
++a wallet MAY prefer them, since spending them cancels the outstanding transactions. The wallet MUST verify that an
++identifier resolves within the requesting scope only (an `id` never resolves into another scope).
 +
  Following steps need to be taken, from perspective of wallet state:
  
@@ -354,22 +398,21 @@ index f30fd3b..a8fd833 100644
  2. Prepare change outputs, add them to pending coin pool
  3. Prepare transaction, add it to pending transaction pool
  
-+A transaction built with an authorization stays in the pending pool like any other until the wallet either submits it
-+or hands it off with `detach_transaction`. Selection, pinning and booking MUST happen in one atomic step, so that two
-+concurrent builds cannot pin or book the same coin.
++Selection, pinning and booking MUST happen in one atomic step, so that two concurrent builds cannot book the same
++coin at the same time (they may, deliberately, pin it under the same identifier one after the other).
 +
  #### `watch_for`
  
  Watches for a coin whose details are provided. There are limitations, which require usage of this operation to receive
-@@ -735,6 +977,74 @@ transaction history with "expected" status.
+@@ -735,6 +1020,63 @@ transaction history with "expected" status.
  Note: in many cases such transaction would be requested to be balanced, in such case the final transaction should only
  be added as pending one.
  
 +#### `hold`
 +
-+Creates a hold for a scope without building a transaction (see [Holds and pinned coins](#holds-and-pinned-coins)) -
-+for reserving an amount up front, or for setting a policy before the first build with `use`/`mark` would create the
-+hold implicitly. Parameters:
++Reserves coins under an identifier without building a transaction (see [Holds and pinned coins](#holds-and-pinned-coins))
++- to commit an amount up front, or to set a policy (`single` mode, expiry, note) before the first build with `use`
++would create the hold implicitly. Parameters:
 +
 +- the requesting scope, derived by the wallet
 +- the `id` chosen by the scope; if a hold with that `id` already exists in the scope, the selected coins are added to it
@@ -380,9 +423,10 @@ index f30fd3b..a8fd833 100644
 +Steps:
 +
 +1. Resolve the selection to a set of own **final, unpinned** coins; fail if it cannot be satisfied (the error MUST NOT
-+   reveal whether coins pinned by other holds would have satisfied it)
++   reveal whether coins pinned under other identifiers would have satisfied it)
 +2. Validate the policy against wallet limits (maximum duration, maximum number of holds per scope, metadata size)
-+3. Atomically create or extend the hold, set the coins to `Booked` with a booking record naming it, and persist
++3. Atomically create or extend the hold, add a `reservation` reference with `validUntil = expires_at` to each coin
++   (setting it to `Booked` if it was `Final`), and persist
 +
 +Holds MUST be persisted with the rest of the wallet state and MUST be restored before any spend is allowed after a
 +restart. If the persisted hold state cannot be read or validated, the wallet MUST refuse ordinary spends rather than
@@ -395,48 +439,36 @@ index f30fd3b..a8fd833 100644
 +
 +#### `detach_transaction`
 +
-+Hands a transaction built with an authorization off to its hold's scope as a candidate. It is the counterpart of
-+`discard_transaction` for the case where the wallet is *not* the submitter. The hold is the one named in the booking
-+records of the transaction's inputs. Steps:
++Drops candidates. It is the counterpart of `discard_transaction` for transactions the wallet did not intend to submit.
++Two forms, both resolved within the requesting scope (the wallet user may drop anything):
 +
-+1. Verify the transaction is in the pending pool and that its inputs are booked under one hold of the requesting scope
-+2. Record the candidate: identifying components, coins it would create, validity bound; set the transaction's
-+   submitter to the scope
-+3. Remove the `transaction` field from the booking record of each input, so that the inputs are `Booked` by the hold
-+   only; keep the coins it would create as expected ones, excluded from the pending balance
-+4. Any unpinned coin the build had to add is already pinned in the hold (see `spend`); verify this invariant
-+5. Persist atomically, then return the serialized transaction to the scope
++- `detach_transaction(transaction, {force?})` - drop one candidate. Identify it by its components (the bytes handed
++  back may have been merged with others). Steps:
++  1. Remove the candidate's reference from every coin carrying it
++  2. Mark the candidate `Rejected(detached)`; if its validity bound has not passed and `force` is not set, add an
++     `outstanding` entry for it to each of those coins. `force: true` is the caller's assertion that the candidate was
++     never made public (never sent, never published), so no memory of it is needed; the wallet MAY record the
++     assertion in history and MAY require the wallet user's confirmation when it comes from a scope
++  3. Any coin whose booking record is now empty returns to `Final`
++  4. Persist atomically. Dropping a candidate that is not live is a no-op.
++- `detach_transaction({id}, {force?})` - drop everything under (scope, `id`): every candidate reference, the
++  reservation if any, and the hold's policy, with the same per-candidate effects (`force` applies to all of them).
++  Dropping an unknown identifier is a no-op.
 +
-+After `detach_transaction` the same coins can be used again by another authorized build for the same hold if its mode
-+is `multi`, which is how several mutually exclusive candidates are produced from one set of coins; a `single` hold
-+accepts a new build only once its live candidate is no longer `Pending`. The wallet SHOULD warn the user, when
-+presenting a hold, that candidates are outside the wallet's control: they may be submitted by the scope at any time
-+before they become stale, and local release does not revoke them.
++Dropping does not revoke: a candidate already handed out may still settle until its validity bound passes or its coins
++are spent. The coins are available again as soon as nothing else pins them, and the `outstanding` warning is what tells
++the user. Spending the coins is the only definitive cancellation; ordinary coin selection MAY prefer coins with
++`outstanding` entries, and the wallet MAY offer a "cancel" convenience that drops the candidates and self-transfers
++those coins together.
 +
-+#### `release_hold`
-+
-+Ends the hold (scope, `id`). Steps:
-+
-+1. Resolve `id` within the requesting scope (the wallet user may release any hold); fail as not found otherwise
-+2. Mark every live candidate `Rejected(released)`, keeping its validity bound
-+3. For every coin booked by the hold: remove the `hold` field from its booking record; if the record is now empty the
-+   coin returns to `Final`, with one `outstanding` entry per candidate that used it and whose validity bound has not
-+   passed
-+4. Persist atomically
-+
-+The coins are available again immediately, as the user intends, but the wallet MUST make it clear that candidates
-+already handed out may still settle until their validity bound passes or the coins are spent: this is what the
-+`outstanding` warning conveys. Spending the coins is the only definitive cancellation; ordinary coin selection SHOULD
-+therefore prefer coins with `outstanding` entries, and the wallet MAY offer a "cancel" convenience that performs the
-+release and a self-transfer of those coins together.
-+
-+A hold whose `expires_at` has passed is released automatically with the same effects. Expiry is evaluated against the
-+wallet clock and SHOULD include the same latency margin used for TTL handling.
++Expiry needs no operation: references are pruned when their validity bound passes, so a hold whose reservation lapsed
++and whose candidates all went stale releases its coins by itself. Expiry is evaluated against the wallet clock and
++SHOULD include the same latency margin used for TTL handling.
 +
  ## Synchronization process
  
  Literal implementation of a Midnight Wallet, applying transactions one by one, provided by a local node is the best
-@@ -1074,6 +1384,36 @@ The resulting transaction will only have outputs to be received defined, with no
+@@ -1074,6 +1416,37 @@ The resulting transaction will only have outputs to be received defined, with no
  balancing the transaction must be employed before the swap offer is ready to be submitted, with proper target imbalances
  indicated.
  
@@ -461,7 +493,8 @@ index f30fd3b..a8fd833 100644
 +4. Prove, sign the intent (if any) and bind. The result is a transaction whose guaranteed shielded offer and whose
 +   intent (if any) are mergeable as a unit by any party: shielded offers merge by set union, intents merge by segment
 +   id.
-+5. `detach_transaction` it and return it to the caller together with its validity bound.
++5. Hand it to the caller together with its validity bound (this is the end of the authorized `spend`: the candidate
++   reference is recorded on its inputs and the transaction booking released).
 +
 +Repeating steps 1-5 with the same `use: X` and different amounts or recipients produces sibling candidates from the
 +same coins (the hold is `multi`). The validity bound of a candidate is the minimum of: the root retention window for its shielded and Dust inputs
@@ -473,19 +506,19 @@ index f30fd3b..a8fd833 100644
  #### Contract call
  
  Contract calls are prepared by other components than wallet. Once ready, in most cases an unbalanced transaction would
-@@ -1141,6 +1481,10 @@ Conceptually, the process follows given steps:
+@@ -1141,6 +1514,10 @@ Conceptually, the process follows given steps:
  
  Once transaction is created, it can be submitted to the network or other party.
  
-+Pending transactions whose submitter is a scope (candidates, see [`detach_transaction`](#detach_transaction)) are
-+never submitted or re-submitted by the wallet; the scope that received them is responsible for submission, usually
-+after merging them with other transactions.
++Pending transactions whose submitter is a scope (candidates, see [`spend`](#spend)) are never submitted or
++re-submitted by the wallet; the scope that received them is responsible for submission, usually after merging them
++with other transactions.
 +
  For cases, where the wallet submits a transaction to the network, it is advised that the wallet implements a
  re-submission mechanism. A blockchain is a distributed system and there are many possible issues, which may arise due
  to, among others, networking problems such as a node being temporarily unavailable, the network being congested or a
 diff --git a/docs/spec/coin-lifecycle.puml b/docs/spec/coin-lifecycle.puml
-index 10d6608..f6e92c6 100644
+index 10d6608..65ff91e 100644
 --- a/docs/spec/coin-lifecycle.puml
 +++ b/docs/spec/coin-lifecycle.puml
 @@ -1,25 +1,36 @@
@@ -503,10 +536,10 @@ index 10d6608..f6e92c6 100644
 +state final as "Final": Coin received in a finalized transaction\nPart of available balance\nMay carry 'outstanding' entries: transactions that\ncould still consume it (warning shown, still available)
 +state booked as "Booked (not part of balance)" {
 +  state bookedTx as "by transaction": Booked for a pending transaction\n(current behaviour)
-+  state bookedHold as "by hold": Pinned: reserved by a hold, idle\nIn the owning scope's held balance
-+  state bookedBoth as "by hold and transaction": Pinned and booked by a\ncandidate being built
++  state bookedHold as "by holds": Pinned: references under (scope, id)\ncount = live candidates + reservation\nIn the owning scope's held balance
++  state bookedBoth as "by holds and transaction": Pinned and booked by a\ncandidate being built
 +  bookedHold -down-> bookedBoth : spend(use)
-+  bookedBoth -up-> bookedHold : detach_transaction\n| discard
++  bookedBoth -up-> bookedHold : handoff (end of build)\n| discard
 +}
 +note bottom of booked : rollback of a transaction that spent\nbooked coins keeps them booked
 +state spent as "Spent" : Coin spent in a transaction\nNot part of balance
@@ -527,8 +560,8 @@ index 10d6608..f6e92c6 100644
  pending --> [*] : discard
 -spent --> booked : rollback
 +final -down-> bookedTx : spend | apply(spend)
-+final -down-> bookedHold : hold | spend(mark)
-+bookedHold -up-> final : release_hold | expiry\n(+ outstanding entries)
++final -down-> bookedHold : hold | spend(use)
++bookedHold -up-> final : last reference dropped\n(detach_transaction | expiry)\n(+ outstanding entries)
 +bookedTx -up-> final : discard\n(+ outstanding entry if shared)
 +booked -right-> spent : apply
 +final -down-> spent : apply\n(outstanding tx settled)
@@ -538,7 +571,7 @@ index 10d6608..f6e92c6 100644
  
  @enduml
 diff --git a/docs/spec/tx-lifecycle.puml b/docs/spec/tx-lifecycle.puml
-index e2d95b6..b11fa46 100644
+index e2d95b6..9e18556 100644
 --- a/docs/spec/tx-lifecycle.puml
 +++ b/docs/spec/tx-lifecycle.puml
 @@ -9,7 +9,7 @@ state confirmed as "Confirmed" {
@@ -555,16 +588,16 @@ index e2d95b6..b11fa46 100644
  }
  
 -state rejected as "Rejected"
-+state rejected as "Rejected": reason = discarded | released | invalidated | stale | expired\nkeeps validity bound while it may still settle
++state rejected as "Rejected": reason = discarded | detached | invalidated | stale | expired\nkeeps validity bound while it may still settle
  
 -[*] --> pending : spend | watch_for
-+[*] --> pending : spend | watch_for | detach_transaction
++[*] --> pending : spend | watch_for | spend(use)
  [*] --> confirmed : apply
  pending --> confirmed : apply
  confirmed --> final : finalize
  confirmed --> pending : rollback
 -pending ---> rejected : discard
-+pending ---> rejected : discard | release_hold | sibling settles | validity bound passes
++pending ---> rejected : discard | detach_transaction | sibling settles | validity bound passes
 +rejected --> confirmed : apply (outstanding transaction settled by another party)
  confirmed --> rejected : discard
  

@@ -1,7 +1,7 @@
 From 9bf4fd446b1ebadc37d87b64d9e07644d4e97146 Mon Sep 17 00:00:00 2001
 From: Eddie <edward.alvarado@midnight.foundation>
 Date: Tue, 8 Sep 2026 10:51:21 -0300
-Subject: [PATCH 1/6] docs(spec): propose holds and pinned coins for deferred,
+Subject: [PATCH 1/7] docs(spec): propose holds and pinned coins for deferred,
  mutually exclusive offers
 
 Adds a wallet-local hold model to the Wallet Specification: a Pinned coin

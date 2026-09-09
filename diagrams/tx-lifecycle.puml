@@ -17,14 +17,14 @@ state final as "Final" {
   state failureF as "Failure"
 }
 
-state rejected as "Rejected": reason = discarded | released | invalidated | stale | expired\nkeeps validity bound while it may still settle
+state rejected as "Rejected": reason = discarded | detached | invalidated | stale | expired\nkeeps validity bound while it may still settle
 
-[*] --> pending : spend | watch_for | detach_transaction
+[*] --> pending : spend | watch_for | spend(use)
 [*] --> confirmed : apply
 pending --> confirmed : apply
 confirmed --> final : finalize
 confirmed --> pending : rollback
-pending ---> rejected : discard | release_hold | sibling settles | validity bound passes
+pending ---> rejected : discard | detach_transaction | sibling settles | validity bound passes
 rejected --> confirmed : apply (outstanding transaction settled by another party)
 confirmed --> rejected : discard
 
