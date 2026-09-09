@@ -1,7 +1,8 @@
 From c8aac6445e3e0cf211cc7c5d053b56d372337ccb Mon Sep 17 00:00:00 2001
 From: Eddie <edward.alvarado@midnight.foundation>
 Date: Tue, 8 Sep 2026 23:58:08 -0300
-Subject: [PATCH 9/9] docs(spec): list_holds reports a scope's own pinned coins
+Subject: [PATCH 09/10] docs(spec): list_holds reports a scope's own pinned
+ coins
 
 ---
  docs/spec/Specification.md | 23 ++++++++++++++++++++++-

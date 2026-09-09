@@ -1,7 +1,7 @@
 From 0eaf67f67e335f0a3b425d5660afd81380bebbe0 Mon Sep 17 00:00:00 2001
 From: Eddie <edward.alvarado@midnight.foundation>
 Date: Tue, 8 Sep 2026 19:25:22 -0300
-Subject: [PATCH 5/9] docs(spec): holds keyed by scope-chosen ids; use/mark
+Subject: [PATCH 05/10] docs(spec): holds keyed by scope-chosen ids; use/mark
  authorization on spend; default selection unchanged
 
 ---

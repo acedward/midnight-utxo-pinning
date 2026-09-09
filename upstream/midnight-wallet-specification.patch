@@ -1,8 +1,8 @@
 diff --git a/docs/spec/Specification.md b/docs/spec/Specification.md
-index f30fd3b..22cbda2 100644
+index f30fd3b..0a0bc4d 100644
 --- a/docs/spec/Specification.md
 +++ b/docs/spec/Specification.md
-@@ -67,6 +67,12 @@ This document comprises a couple of sections:
+@@ -67,6 +67,13 @@ This document comprises a couple of sections:
      - [Mint claim](#mint-claim)
    - [State management](#state-management)
      - [Balances](#balances)
@@ -12,10 +12,11 @@ index f30fd3b..22cbda2 100644
 +      - [Candidate transactions](#candidate-transactions)
 +      - [Coin and transaction lifecycle with holds](#coin-and-transaction-lifecycle-with-holds)
 +      - [Privacy of holds](#privacy-of-holds)
++      - [Compatibility](#compatibility)
      - [Operations](#operations)
        - [`apply_transaction`](#apply_transaction)
          - [Steps to apply shielded offer of a section](#steps-to-apply-shielded-offer-of-a-section)
-@@ -78,6 +84,9 @@ This document comprises a couple of sections:
+@@ -78,6 +85,9 @@ This document comprises a couple of sections:
        - [`discard_transaction`](#discard_transaction)
        - [`spend`](#spend)
        - [`watch_for`](#watch_for)
@@ -25,7 +26,7 @@ index f30fd3b..22cbda2 100644
    - [Synchronization process](#synchronization-process)
      - [Indexing service for shielded tokens](#indexing-service-for-shielded-tokens)
      - [Indexing service for unshielded tokens](#indexing-service-for-unshielded-tokens)
-@@ -100,6 +109,7 @@ This document comprises a couple of sections:
+@@ -100,6 +110,7 @@ This document comprises a couple of sections:
      - [Building stages](#building-stages)
        - [Prepare transfer](#prepare-transfer)
        - [Prepare a swap](#prepare-a-swap)
@@ -33,7 +34,7 @@ index f30fd3b..22cbda2 100644
        - [Contract call](#contract-call)
        - [Balance transaction](#balance-transaction)
    - [Transaction submission](#transaction-submission)
-@@ -516,6 +526,10 @@ Because a transaction can always be extended (by adding new intents or merging s
+@@ -516,6 +527,10 @@ Because a transaction can always be extended (by adding new intents or merging s
  reliable identifier to use when looking for transaction confirmation. Instead, transactions should be identified by
  their known components: value commitments of shielded offers or binding commitments of intents.
  
@@ -44,7 +45,7 @@ index f30fd3b..22cbda2 100644
  ### Mint claim
  
  A system transaction can be issued by Midnight nodes to mint certain amount of tokens as a reward a party. Such minted
-@@ -541,6 +555,8 @@ consists of the data needed to spend coins and pay fees
+@@ -541,6 +556,8 @@ consists of the data needed to spend coins and pay fees
  - a set of own Dust outputs paired with Dust actions containing them
  - a Merkle tree of Dust generation infos
  - a Merkle tree of Dust commitments
@@ -53,7 +54,7 @@ index f30fd3b..22cbda2 100644
  
  Owned coins do not have to be spendable at particular point. They might also be coins that the wallet was let know of,
  which are expected to be included in one of the future transactions.
-@@ -548,7 +564,7 @@ which are expected to be included in one of the future transactions.
+@@ -548,7 +565,7 @@ which are expected to be included in one of the future transactions.
  Additionally, it is in practice important to track progress of synchronization with chain, pool of pending transactions
  and transaction history.
  
@@ -62,7 +63,7 @@ index f30fd3b..22cbda2 100644
  
  - `apply_transaction(transaction, status, timestamp, expected_roots,  genearations_tree_update)` - which updates the
    state with a transaction observed on chain, this operation allows to learn about incoming tokens
-@@ -556,8 +572,17 @@ There are 6 foundational operations defined, which should be atomic to whole wal
+@@ -556,8 +573,17 @@ There are 6 foundational operations defined, which should be atomic to whole wal
  - `finalize_transaction(transaction)` - which marks transaction as final according to consensus rules
  - `rollback_last_transaction` - which reverts effects of applying last transaction
  - `discard_transaction(transaction)` - which considers a pending transaction irreversibly failed
@@ -81,7 +82,7 @@ index f30fd3b..22cbda2 100644
  
  Functions `apply_transaction`, `finalize_transaction` and `rollback_transaction` can be extended to blocks, ranges of
  blocks or other data to reconstruct the wallet state. Since shielded tokens are implemented using effectively a UTxO
-@@ -590,11 +615,225 @@ distinct balances recognized:
+@@ -590,11 +616,243 @@ distinct balances recognized:
  - total - sum of available and pending balances; it represents total amount of tokens under wallet's control, taking
    into consideration known pending transactions and coins
  
@@ -304,10 +305,28 @@ index f30fd3b..22cbda2 100644
 +Zswap offers and is limited to the scope the candidate was built for; it is also what allows that scope to detect
 +conflicts between its own candidates.
 +
++#### Compatibility
++
++For wallet state, holds are additive: a wallet that does not implement them reads every state as before (a booked coin
++is unavailable, a final coin is available, a pending transaction is in flight), and persisted metadata it does not
++understand can be ignored.
++
++For the parties that request builds, holds are a change in behaviour. A wallet that does not implement them does not
++know the `use` and `mark` fields of an authorization; depending on how strictly it validates requests it will reject
++the build or, worse, ignore the fields and select coins as for an ordinary spend - no pin, no candidate, and a second
++build that silently spends different coins. Therefore:
++
++- a scope MUST verify that the wallet implements holds before relying on an authorization, `hold`,
++  `detach_transaction` or `list_holds`, and MUST otherwise behave as if every build were single-use; how a wallet
++  advertises support is left to the application-facing interface
++- a wallet that implements holds MUST fail a build whose authorization it cannot honour (identifier limits, coin kind,
++  policy) instead of falling back to ordinary selection
++- requests without an authorization are unaffected: `spend` behaves exactly as before
++
  ### Operations
  
  #### `apply_transaction`
-@@ -621,7 +860,14 @@ fallible section.
+@@ -621,7 +879,14 @@ fallible section.
  1. Update coin commitment tree with commitments of outputs and transients present in the offer
  2. Verify obtained coin commitment tree root against provided one, implementation needs to revert updates to coin
     commitment tree and abort in case of inconsistency
@@ -323,7 +342,7 @@ index f30fd3b..22cbda2 100644
  4. Watch for received coins, for each output:
     1. Match commitment with a set of pending coins, if there is a match, mark the matching pending coin as confirmed
     2. If commitment is not a match, try to decrypt output ciphertext, if decryption succeeds - add coin to known set as
-@@ -630,7 +876,9 @@ fallible section.
+@@ -630,7 +895,9 @@ fallible section.
  
  ##### Steps to apply unshielded offer of a section
  
@@ -334,7 +353,7 @@ index f30fd3b..22cbda2 100644
  2. Filter outputs to narrow them down to only ones received by tracked addresses, for each one:
     1. Match the coin with pending ones, if there is a match, mark the matching pending coin as confirmed.
     2. Otherwise, add a coin to the known set as a confirmed.
-@@ -690,7 +938,11 @@ It needs to:
+@@ -690,7 +957,11 @@ It needs to:
     3. Restore coins spent in the transaction in a booked state
     4. Undo setting timestamp on Dust generation info related to Night UTxOs spent in the transaction
     5. Remove related Dust generation info
@@ -347,7 +366,7 @@ index f30fd3b..22cbda2 100644
  
  There are a couple of practical considerations:
  
-@@ -706,9 +958,15 @@ giving up on submitting one. Following steps need to be taken:
+@@ -706,9 +977,15 @@ giving up on submitting one. Following steps need to be taken:
  
  1. Move transaction to transaction history as failed
  2. Remove coins received in the transaction
@@ -364,7 +383,7 @@ index f30fd3b..22cbda2 100644
  #### `spend`
  
  Spend coins in a transaction, either by initiating swap, making transfer or balancing other transaction. Only final
-@@ -718,12 +976,41 @@ In certain situations implementation might allow to use confirmed and yet not fi
+@@ -718,12 +995,41 @@ In certain situations implementation might allow to use confirmed and yet not fi
  fail in case of reorganization because of coin commitment tree root mismatch, so a special care should be put into user
  experience of managing such transactions.
  
@@ -406,7 +425,7 @@ index f30fd3b..22cbda2 100644
  #### `watch_for`
  
  Watches for a coin whose details are provided. There are limitations, which require usage of this operation to receive
-@@ -735,6 +1022,80 @@ transaction history with "expected" status.
+@@ -735,6 +1041,80 @@ transaction history with "expected" status.
  Note: in many cases such transaction would be requested to be balanced, in such case the final transaction should only
  be added as pending one.
  
@@ -487,7 +506,7 @@ index f30fd3b..22cbda2 100644
  ## Synchronization process
  
  Literal implementation of a Midnight Wallet, applying transactions one by one, provided by a local node is the best
-@@ -1074,6 +1435,36 @@ The resulting transaction will only have outputs to be received defined, with no
+@@ -1074,6 +1454,36 @@ The resulting transaction will only have outputs to be received defined, with no
  balancing the transaction must be employed before the swap offer is ready to be submitted, with proper target imbalances
  indicated.
  
@@ -524,7 +543,7 @@ index f30fd3b..22cbda2 100644
  #### Contract call
  
  Contract calls are prepared by other components than wallet. Once ready, in most cases an unbalanced transaction would
-@@ -1141,6 +1532,10 @@ Conceptually, the process follows given steps:
+@@ -1141,6 +1551,10 @@ Conceptually, the process follows given steps:
  
  Once transaction is created, it can be submitted to the network or other party.
  

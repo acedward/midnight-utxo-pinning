@@ -1,8 +1,8 @@
 From 24d1f0e369585a7c12d80ffd496d3786b16c3954 Mon Sep 17 00:00:00 2001
 From: Eddie <edward.alvarado@midnight.foundation>
 Date: Tue, 8 Sep 2026 23:32:28 -0300
-Subject: [PATCH 7/9] docs(spec): refcount pins per (scope, id); use + optional
- mark; detach_transaction with force replaces release_hold
+Subject: [PATCH 07/10] docs(spec): refcount pins per (scope, id); use +
+ optional mark; detach_transaction with force replaces release_hold
 
 ---
  docs/spec/Specification.md    | 297 +++++++++++++++++++---------------

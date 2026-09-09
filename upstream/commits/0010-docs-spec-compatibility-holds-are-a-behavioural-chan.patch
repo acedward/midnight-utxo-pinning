@@ -1,0 +1,50 @@
+From 9285d2247d51b795e30eb19ab721f24940ff8bfa Mon Sep 17 00:00:00 2001
+From: Eddie <edward.alvarado@midnight.foundation>
+Date: Wed, 9 Sep 2026 00:08:57 -0300
+Subject: [PATCH 10/10] docs(spec): compatibility - holds are a behavioural
+ change scopes must detect; no silent fallback
+
+---
+ docs/spec/Specification.md | 19 +++++++++++++++++++
+ 1 file changed, 19 insertions(+)
+
+diff --git a/docs/spec/Specification.md b/docs/spec/Specification.md
+index 22cbda2..0a0bc4d 100644
+--- a/docs/spec/Specification.md
++++ b/docs/spec/Specification.md
+@@ -73,6 +73,7 @@ This document comprises a couple of sections:
+       - [Candidate transactions](#candidate-transactions)
+       - [Coin and transaction lifecycle with holds](#coin-and-transaction-lifecycle-with-holds)
+       - [Privacy of holds](#privacy-of-holds)
++      - [Compatibility](#compatibility)
+     - [Operations](#operations)
+       - [`apply_transaction`](#apply_transaction)
+         - [Steps to apply shielded offer of a section](#steps-to-apply-shielded-offer-of-a-section)
+@@ -834,6 +835,24 @@ Note that the ledger data inside a candidate reveals its input nullifiers to who
+ Zswap offers and is limited to the scope the candidate was built for; it is also what allows that scope to detect
+ conflicts between its own candidates.
+ 
++#### Compatibility
++
++For wallet state, holds are additive: a wallet that does not implement them reads every state as before (a booked coin
++is unavailable, a final coin is available, a pending transaction is in flight), and persisted metadata it does not
++understand can be ignored.
++
++For the parties that request builds, holds are a change in behaviour. A wallet that does not implement them does not
++know the `use` and `mark` fields of an authorization; depending on how strictly it validates requests it will reject
++the build or, worse, ignore the fields and select coins as for an ordinary spend - no pin, no candidate, and a second
++build that silently spends different coins. Therefore:
++
++- a scope MUST verify that the wallet implements holds before relying on an authorization, `hold`,
++  `detach_transaction` or `list_holds`, and MUST otherwise behave as if every build were single-use; how a wallet
++  advertises support is left to the application-facing interface
++- a wallet that implements holds MUST fail a build whose authorization it cannot honour (identifier limits, coin kind,
++  policy) instead of falling back to ordinary selection
++- requests without an authorization are unaffected: `spend` behaves exactly as before
++
+ ### Operations
+ 
+ #### `apply_transaction`
+-- 
+2.50.1 (Apple Git-155)
+

@@ -309,6 +309,28 @@ service, expiring at its TTL.
 - Inside the owning scope, shared nullifiers across candidates are visible on purpose: the marketplace must not merge
   two conflicting bids, or the ledger rejects the double spend and the whole guaranteed section with it.
 
+## Compatibility: a breaking change for dApps
+
+For the wallet's own state the proposal is additive: a wallet that does not implement holds reads every state as it
+does today. Booked coins are unavailable, final coins are available, pending transactions are in flight.
+
+For dApps it is a breaking change in behaviour. A wallet that does not implement this proposal does not know the
+`use` and `mark` fields. Depending on how strictly it validates its inputs it will either reject the request or, worse,
+ignore the fields and build the transaction with whatever coins ordinary selection picks: no pin, no candidate, no
+reuse, and a second build that silently spends different coins. A dApp that assumes the bidding semantics on such a
+wallet gets transactions that look right and behave wrong.
+
+Therefore:
+
+- A dApp MUST verify that the connected wallet implements holds before relying on `use`, `mark`, `hold`,
+  `detach_transaction` or `list_holds`, and MUST fall back to single-use behaviour otherwise. How a wallet advertises
+  support is a connector concern and will be specified with the connector changes; `list_holds` answering at all is
+  the minimal signal.
+- A wallet that implements this proposal MUST fail a build whose authorization it cannot honour (unknown identifier
+  semantics, unsupported coin kind, policy limits) instead of falling back to ordinary selection. Silent fallback is
+  the one behaviour this proposal must never produce.
+- Existing dApps that never send an authorization are unaffected: without one, `spend` behaves exactly as today.
+
 ## What this proposal does not do
 
 - It locks nothing on chain. A pin is wallet policy; the only on-chain effect is the transaction that finally spends
@@ -330,10 +352,7 @@ service, expiring at its TTL.
 
 ## Open points for reviewers
 
-None at the moment. Earlier open points (hold mode vs. count, exposing network parameters, fee shortfall on
-fee-paying candidates, segment-id collisions, implicit-hold defaults) were resolved by simplifying the model: there is no
-hold mode, the wallet exposes no network parameters, and fee and segment-id handling belong to the settlement design,
-not to the wallet state.
+None at the moment.
 
 ## License
 

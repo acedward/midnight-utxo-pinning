@@ -226,6 +226,24 @@ Note that the ledger data inside a candidate reveals its input nullifiers to who
 Zswap offers and is limited to the scope the candidate was built for; it is also what allows that scope to detect
 conflicts between its own candidates.
 
+### Compatibility
+
+For wallet state, holds are additive: a wallet that does not implement them reads every state as before (a booked coin
+is unavailable, a final coin is available, a pending transaction is in flight), and persisted metadata it does not
+understand can be ignored.
+
+For the parties that request builds, holds are a change in behaviour. A wallet that does not implement them does not
+know the `use` and `mark` fields of an authorization; depending on how strictly it validates requests it will reject
+the build or, worse, ignore the fields and select coins as for an ordinary spend - no pin, no candidate, and a second
+build that silently spends different coins. Therefore:
+
+- a scope MUST verify that the wallet implements holds before relying on an authorization, `hold`,
+  `detach_transaction` or `list_holds`, and MUST otherwise behave as if every build were single-use; how a wallet
+  advertises support is left to the application-facing interface
+- a wallet that implements holds MUST fail a build whose authorization it cannot honour (identifier limits, coin kind,
+  policy) instead of falling back to ordinary selection
+- requests without an authorization are unaffected: `spend` behaves exactly as before
+
 ## 3. Operations
 
 ### 3.1 `spend` — authorization
@@ -454,6 +472,7 @@ Each requirement is traceable to the text above and to at least one conformance 
 | R-30 | A held offer MUST be built through `spend` with an authorization; pure shielded candidates MUST contain no intent; candidates with unshielded inputs or Dust spends MUST carry one intent with a randomly chosen segment id and a TTL. | 4 |
 | R-31 | `force: true` on `detach_transaction` MUST suppress the `outstanding` entry; the wallet MAY record the caller's assertion in history and MAY require the wallet user's confirmation when the request comes from a scope. | 3.2 |
 | R-32 | `list_holds(scope)` MUST report, for the requesting scope only, each identifier with the amount pinned per token type, its live candidates (identified by components the scope already holds) with validity bounds, the reservation expiry and the number of outstanding entries; it MUST NOT reveal coin identifiers, nonces, Merkle indices or anything about other scopes, and an empty report MUST be indistinguishable from a wallet that never had holds. | 3.2 |
+| R-33 | A scope MUST verify wallet support before relying on an authorization, `hold`, `detach_transaction` or `list_holds`; a wallet implementing holds MUST fail a build whose authorization it cannot honour instead of falling back to ordinary selection; requests without an authorization MUST behave exactly as before. | 2, compatibility |
 
 ## 6. Conformance scenarios
 
@@ -484,3 +503,4 @@ Each scenario names the requirements it exercises. Coin X is a final 150 NIGHT s
 | C-17 | X final, wallet-submitted transaction T booked X, T was exported to a third party | T is discarded before its bound | X `Final` with an outstanding entry for T; if T later confirms, `Rejected → Confirmed` | R-20, R-18 |
 | C-18 | two concurrent builds with different ids compete for the last unpinned coin | both run | exactly one pins it; the other fails with the ordinary error (it cannot take a coin pinned only under another id) | R-09, R-12 |
 | C-19 | C-02a | M calls `list_holds`; N calls `list_holds` | M sees r7: 150 NIGHT, candidates A, B, C; r8: 150 NIGHT, candidate D, each with its bound, and no coin identifiers; N receives an empty report | R-32, R-26, R-27 |
+| C-20 | a wallet implementing holds, a build with an authorization it cannot honour (e.g. an identifier over the wallet's hold limit) | the build is requested | the build fails; no coin is selected or booked by ordinary selection | R-33 |
