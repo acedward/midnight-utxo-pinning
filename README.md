@@ -353,7 +353,3 @@ Therefore:
 ## Open points for reviewers
 
 None at the moment.
-
-## License
-
-Apache-2.0. See [LICENSE](LICENSE).
